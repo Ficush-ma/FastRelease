@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>FastRelease</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ======== 顶部仓库栏 ======== -->
+    <header class="topbar">
+      <div class="repo-row">
+        <div class="logo" title="FastRelease">
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+            <path d="M8 1.5 14.5 5v6L8 14.5 1.5 11V5L8 1.5Z" fill="none" stroke="currentColor" stroke-width="1.2"/>
+            <path d="M8 5.2v5.6M5.2 6.6 8 5.2l2.8 1.4" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <label class="label" for="repoPath">仓库</label>
+        <input id="repoPath" class="repo-input" spellcheck="false" placeholder="选择一个 git 仓库目录，例如 D:\work\your-project" />
+        <button id="btnBrowse" class="btn">浏览…</button>
+        <button id="btnRecent" class="btn icon-only" title="最近打开的仓库">
+          <svg viewBox="0 0 16 16" width="12" height="12"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="spacer"></div>
+        <div id="headInfo" class="head-info"></div>
+        <button id="btnRefreshAll" class="btn icon-btn" title="刷新全部 (F5)">
+          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M13.5 8a5.5 5.5 0 1 1-1.7-3.97M13.5 2.5v3.2h-3.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button id="btnOpenFolder" class="btn icon-btn" title="在资源管理器中打开仓库">
+          <svg viewBox="0 0 16 16" width="14" height="14"><path d="M1.8 4.2h4l1.2 1.6h7.2v6.4a1 1 0 0 1-1 1H2.8a1 1 0 0 1-1-1V4.2Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        </button>
+        <button id="btnSettings" class="btn icon-btn" title="设置">
+          <svg viewBox="0 0 16 16" width="14" height="14"><circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5 4.8 4.8M11.2 11.2l1.3 1.3M12.5 3.5 11.2 4.8M4.8 11.2 3.5 12.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+      <div id="repoWarning" class="repo-warning hidden"></div>
+      <div id="pickBanner" class="pick-banner hidden">
+        <span class="pb-icon">!</span>
+        <span id="pickBannerText"></span>
+        <div class="spacer"></div>
+        <button id="btnResumePick" class="btn small primary">继续解决冲突</button>
+        <button id="btnAbortPick" class="btn small">中止摘取</button>
+      </div>
+    </header>
+
+    <!-- ======== 功能页签 ======== -->
+    <div class="tabbar">
+      <button class="tab active" data-tab="merge">快速合并</button>
+      <button class="tab" data-tab="check">合并检查</button>
+    </div>
+
+    <!-- ======== 双栏提交视图 ======== -->
+    <main class="panes" id="viewMerge">
+      <!-- 左栏 -->
+      <section class="pane" data-side="left">
+        <div class="pane-head">
+          <div class="pane-title-row">
+            <span class="pane-tag" id="leftTag">源分支</span>
+            <select class="branch-select" id="leftBranch"></select>
+            <button class="btn small pull-btn" data-side="left" title="拉取该分支最新代码">
+              <svg viewBox="0 0 16 16" width="12" height="12"><path d="M8 2v8.5M4.6 7.4 8 10.8l3.4-3.4M2.5 13.5h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              拉取
+            </button>
+            <button class="btn small push-btn" data-side="left" title="推送该分支到远端">
+              <svg viewBox="0 0 16 16" width="12" height="12"><path d="M8 13.5V5M4.6 8.2 8 4.8l3.4 3.4M2.5 2.5h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              推送<span class="ahead-badge"></span>
+            </button>
+          </div>
+          <div class="pane-filter-row">
+            <div class="search-box">
+              <svg viewBox="0 0 16 16" width="12" height="12"><circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m10.2 10.2 3 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+              <input class="search-input" spellcheck="false" placeholder="搜索提交信息 / 哈希" />
+              <button class="search-clear" title="清除">×</button>
+            </div>
+            <select class="author-select" title="按作者筛选"><option value="">全部作者</option></select>
+            <select class="time-select">
+              <option value="all">全部时间</option>
+              <option value="today">今天</option>
+              <option value="7">最近 7 天</option>
+              <option value="30" selected>最近 30 天</option>
+              <option value="90">最近 90 天</option>
+              <option value="365">最近一年</option>
+              <option value="custom">自定义…</option>
+            </select>
+            <button class="btn small refresh-btn" title="刷新该栏提交">刷新</button>
+          </div>
+          <div class="custom-range hidden">
+            <input type="date" class="date-from" /> <span class="dash">~</span>
+            <input type="date" class="date-to" />
+            <button class="btn small apply-range">应用</button>
+            <button class="btn small cancel-range">取消</button>
+          </div>
+          <div class="pane-meta">
+            <span class="branch-tip"></span>
+            <span class="spacer"></span>
+            <span class="count-tip"></span>
+          </div>
+        </div>
+        <div class="commit-header">
+          <span class="col-check"><input type="checkbox" class="select-all" title="全选当前列表" /></span>
+          <span class="col-hash">哈希</span>
+          <span class="col-msg">提交信息</span>
+          <span class="col-author">作者</span>
+          <span class="col-date">日期</span>
+        </div>
+        <div class="commit-list" tabindex="0"></div>
+        <div class="pane-foot">
+          <button class="btn small more-btn hidden">加载更多</button>
+          <span class="foot-tip"></span>
+        </div>
+      </section>
+
+      <!-- 中间操作区 -->
+      <div class="transfer">
+        <button id="btnTransfer" class="xfer-btn" disabled>
+          <span class="xfer-arrow">→</span>
+          <span class="xfer-text">摘取</span>
+          <span class="xfer-count">0</span>
+        </button>
+        <button id="btnTransferPush" class="xfer-btn secondary" disabled title="摘取成功后自动推送到远端">
+          <span class="xfer-arrow">→</span>
+          <span class="xfer-text">摘取并推送</span>
+          <span class="xfer-count">0</span>
+        </button>
+        <div class="xfer-hint">选择提交后<br />摘取到对侧</div>
+        <button id="btnClearSel" class="btn tiny clear-sel" disabled>清除选择</button>
+      </div>
+
+      <!-- 右栏 -->
+      <section class="pane" data-side="right">
+        <div class="pane-head">
+          <div class="pane-title-row">
+            <span class="pane-tag" id="rightTag">目标分支</span>
+            <select class="branch-select" id="rightBranch"></select>
+            <button class="btn small pull-btn" data-side="right" title="拉取该分支最新代码">
+              <svg viewBox="0 0 16 16" width="12" height="12"><path d="M8 2v8.5M4.6 7.4 8 10.8l3.4-3.4M2.5 13.5h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              拉取
+            </button>
+            <button class="btn small push-btn" data-side="right" title="推送该分支到远端">
+              <svg viewBox="0 0 16 16" width="12" height="12"><path d="M8 13.5V5M4.6 8.2 8 4.8l3.4 3.4M2.5 2.5h11" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              推送<span class="ahead-badge"></span>
+            </button>
+          </div>
+          <div class="pane-filter-row">
+            <div class="search-box">
+              <svg viewBox="0 0 16 16" width="12" height="12"><circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m10.2 10.2 3 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+              <input class="search-input" spellcheck="false" placeholder="搜索提交信息 / 哈希" />
+              <button class="search-clear" title="清除">×</button>
+            </div>
+            <select class="author-select" title="按作者筛选"><option value="">全部作者</option></select>
+            <select class="time-select">
+              <option value="all">全部时间</option>
+              <option value="today">今天</option>
+              <option value="7">最近 7 天</option>
+              <option value="30" selected>最近 30 天</option>
+              <option value="90">最近 90 天</option>
+              <option value="365">最近一年</option>
+              <option value="custom">自定义…</option>
+            </select>
+            <button class="btn small refresh-btn" title="刷新该栏提交">刷新</button>
+          </div>
+          <div class="custom-range hidden">
+            <input type="date" class="date-from" /> <span class="dash">~</span>
+            <input type="date" class="date-to" />
+            <button class="btn small apply-range">应用</button>
+            <button class="btn small cancel-range">取消</button>
+          </div>
+          <div class="pane-meta">
+            <span class="branch-tip"></span>
+            <span class="spacer"></span>
+            <span class="count-tip"></span>
+          </div>
+        </div>
+        <div class="commit-header">
+          <span class="col-check"><input type="checkbox" class="select-all" title="全选当前列表" /></span>
+          <span class="col-hash">哈希</span>
+          <span class="col-msg">提交信息</span>
+          <span class="col-author">作者</span>
+          <span class="col-date">日期</span>
+        </div>
+        <div class="commit-list" tabindex="0"></div>
+        <div class="pane-foot">
+          <button class="btn small more-btn hidden">加载更多</button>
+          <span class="foot-tip"></span>
+        </div>
+      </section>
+    </main>
+
+    <!-- ======== 合并检查视图 ======== -->
+    <main id="viewCheck" class="check-view hidden">
+      <div class="check-toolbar">
+        <label class="ck-label">源分支</label>
+        <select id="ckSource" class="ck-select"></select>
+        <span class="ck-arrow">→</span>
+        <select id="ckTarget" class="ck-select"></select>
+        <span class="vsep"></span>
+        <label class="ck-label">检测人</label>
+        <select id="ckAuthor" class="ck-select"></select>
+        <label class="ck-label">时间</label>
+        <select id="ckTime" class="ck-select">
+          <option value="7">最近 7 天</option>
+          <option value="30" selected>最近 30 天</option>
+          <option value="90">最近 90 天</option>
+          <option value="180">最近半年</option>
+          <option value="365">最近一年</option>
+          <option value="all">全部时间</option>
+          <option value="custom">自定义…</option>
+        </select>
+        <span id="ckCustomRange" class="ck-custom hidden">
+          <input type="date" id="ckFrom" /> <span class="dash">~</span> <input type="date" id="ckTo" />
+        </span>
+        <button id="ckRun" class="btn primary">开始检测</button>
+        <span id="ckDirty" class="ck-dirty hidden">条件已修改，请重新点「开始检测」</span>
+        <span class="spacer"></span>
+        <label class="ck-toggle"><input type="checkbox" id="ckOnlyUnmerged" checked /> 只看未合并</label>
+      </div>
+
+      <div id="ckSummary" class="check-summary">选择分支和检测人后点「开始检测」</div>
+
+      <div class="check-table">
+        <div class="check-head">
+          <span class="col-hash">哈希</span>
+          <span class="col-msg">提交信息</span>
+          <span class="col-author">作者</span>
+          <span class="col-date">日期</span>
+          <span class="col-state">状态</span>
+        </div>
+        <div id="ckList" class="check-list"></div>
+      </div>
+    </main>
+
+    <!-- ======== 底部状态栏 ======== -->
+    <footer class="statusbar">
+      <div class="status-left">
+        <span id="statusDot" class="dot"></span>
+        <span id="statusText">就绪</span>
+      </div>
+      <div class="status-right">
+        <span id="repoState"></span>
+        <button id="btnToggleLog" class="link-btn">执行日志</button>
+      </div>
+    </footer>
+
+    <div id="logPanel" class="log-panel hidden">
+      <div class="log-head">
+        <span>执行日志</span>
+        <button id="btnClearLog" class="link-btn">清空</button>
+        <button id="btnCloseLog" class="link-btn">隐藏</button>
+      </div>
+      <div id="logBody" class="log-body"></div>
+    </div>
+  </div>
+
+  <!-- ======== 提交详情抽屉 ======== -->
+  <aside id="detailDrawer" class="drawer hidden">
+    <div class="drawer-head">
+      <div class="dh-main">
+        <div id="detailSubject" class="dh-subject"></div>
+        <div id="detailMeta" class="dh-meta"></div>
+      </div>
+      <button id="btnCloseDetail" class="btn icon-btn" title="关闭 (Esc)">
+        <svg viewBox="0 0 16 16" width="13" height="13"><path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div id="detailBody" class="drawer-body"></div>
+  </aside>
+
+  <!-- ======== 冲突解决视图 ======== -->
+  <div id="mergeView" class="overlay hidden">
+    <div class="merge-toolbar">
+      <div class="mt-left">
+        <strong id="mergeTitle">解决冲突</strong>
+        <span id="mergeSubTitle" class="mt-sub"></span>
+      </div>
+      <div class="mt-right">
+        <button id="mfPrev" class="btn small" title="上一处冲突 (Alt+↑)">◀ 上一处</button>
+        <button id="mfNext" class="btn small" title="下一处冲突 (Alt+↓)">下一处 ▶</button>
+        <span class="vsep"></span>
+        <button id="mfUseOurs" class="btn small">用左侧</button>
+        <button id="mfUseTheirs" class="btn small">用右侧</button>
+        <button id="mfUseBoth" class="btn small">两侧都保留</button>
+        <button id="mfExternal" class="btn small" title="用外部合并工具（如 TortoiseGitMerge）打开此文件">外部工具打开…</button>
+        <span class="vsep"></span>
+        <button id="mfSave" class="btn small primary">保存并标记已解决</button>
+        <button id="mfContinue" class="btn small primary">全部完成，继续摘取</button>
+        <button id="mfSkip" class="btn small">跳过此提交</button>
+        <button id="mfAbort" class="btn small danger">中止摘取</button>
+      </div>
+    </div>
+    <div class="merge-body">
+      <aside class="merge-files">
+        <div class="mf-head">冲突文件 <span id="mfFileCount" class="mf-count"></span></div>
+        <div id="mfList" class="mf-list"></div>
+        <div id="mfOther" class="mf-other"></div>
+      </aside>
+      <div class="merge-main">
+        <div class="merge-panes">
+          <div class="mpane">
+            <div class="mpane-head">
+              <span class="side-dot ours"></span>
+              <span id="oursName">当前分支（目标）</span>
+              <span class="mpane-note">ours</span>
+            </div>
+            <div class="mpane-body" id="oursBody"></div>
+          </div>
+          <div class="mpane">
+            <div class="mpane-head">
+              <span class="side-dot theirs"></span>
+              <span id="theirsName">被摘取的提交</span>
+              <span class="mpane-note">theirs</span>
+            </div>
+            <div class="mpane-body" id="theirsBody"></div>
+          </div>
+        </div>
+        <div class="merge-result">
+          <div class="mr-head">
+            <span>合并结果（可直接编辑，删掉冲突标记即视为解决）</span>
+            <span id="mrStatus" class="mr-status"></span>
+          </div>
+          <textarea id="mrText" spellcheck="false"></textarea>
+          <div id="mrBinary" class="mr-binary hidden">
+            <div class="mb-icon">BIN</div>
+            <div class="mb-text">这是二进制文件，无法按文本方式合并。<br />请选择保留哪一侧的版本。</div>
+            <div class="mb-actions">
+              <button id="mfBinaryOurs" class="btn small primary">采用左侧版本</button>
+              <button id="mfBinaryTheirs" class="btn small primary">采用右侧版本</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+
+  <div id="modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-title" id="modalTitle">提示</div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-foot">
+        <button id="modalOk" class="btn primary">确定</button>
+        <button id="modalCancel" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal-backdrop hidden">
+    <div class="modal wide">
+      <div class="modal-title">设置</div>
+      <div class="modal-body">
+        <div class="form-row">
+          <label>外部合并工具（可选）</label>
+          <input id="setMergeTool" class="text-input" placeholder="TortoiseGit 的 bin 目录，如 D:\Program Files\TortoiseGit\bin" />
+        </div>
+        <div class="form-hint">填 TortoiseGit 安装目录或其 bin 目录即可，exe 会自动定位；留空则读注册表和默认安装路径自动探测。不装 TortoiseGit 也没关系，内置冲突解决已可完成全部工作。</div>
+        <div class="form-row">
+          <label>每页提交数</label>
+          <input id="setPageSize" type="number" min="50" max="2000" step="50" class="text-input narrow" />
+        </div>
+        <div class="form-row">
+          <label>拉取方式</label>
+          <select id="setPullMode" class="text-input narrow">
+            <option value="rebase">变基（推荐）</option>
+            <option value="ff">仅快进</option>
+          </select>
+        </div>
+        <div class="form-hint">变基：本地提交会重新排到远端最新提交之后，保持线性历史，符合「有新提交默认变基」的习惯。</div>
+      </div>
+      <div class="modal-foot">
+        <button id="setSave" class="btn primary">保存</button>
+        <button id="setCancel" class="btn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "fast-release",
+  "version": "1.1.6",
+  "description": "FastRelease - 分支提交摘取与推送工具（dev -> release cherry-pick 工作流）",
+  "main": "main.js",
+  "author": "FastRelease",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist": "node scripts/pack.js",
+    "dist:dir": "node scripts/pack.js"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  }
+}
