@@ -726,9 +726,11 @@ async function loadBranches(prefetched) {
   state.panes.left.loadAuthors();
   state.panes.right.loadAuthors();
   await Promise.all([state.panes.left.load(true), state.panes.right.load(true), loadAheads()]);
-  await refreshFlags();
-  state.panes.left.render();
-  state.panes.right.render();
+  // 「已摘取」标记要跑 git cherry（大仓库上很慢）：放后台算，先让界面可用
+  refreshFlags().then(() => {
+    state.panes.left.render();
+    state.panes.right.render();
+  }).catch(() => {});
   updatePaneAhead();
   updateTransferUI();
 
@@ -771,14 +773,21 @@ async function refreshFlags() {
 async function refreshAll(opts = {}) {
   if (!state.dir) return;
   setBusy(true, '正在刷新…');
-  // 仓库信息与分支列表并行，少一次串行等待
-  const [info, br] = await Promise.all([api.repoInfo(state.dir), api.branches(state.dir)]);
-  if (info && info.ok) {
-    state.info = info;
-    updateHeadInfo();
+  try {
+    // 仓库信息与分支列表并行，少一次串行等待
+    const [info, br] = await Promise.all([api.repoInfo(state.dir), api.branches(state.dir)]);
+    if (info && info.ok) {
+      state.info = info;
+      updateHeadInfo();
+    }
+    // 分支列表拿到就解除忙碌，后面的提交加载/标记计算不再锁界面
+    await loadBranches(br);
+  } catch (e) {
+    toast('刷新失败：' + ((e && e.message) || e), 'err');
+  } finally {
+    setBusy(false);
+    updateTransferUI();
   }
-  await loadBranches(br);
-  setBusy(false);
   if (opts.reselect) updateTransferUI();
 }
 
@@ -1892,6 +1901,12 @@ function bindGlobal() {
 /* -------------------------- 启动 -------------------------- */
 
 async function boot() {
+  // 兜底：任何未捕获的异步异常都不能让界面卡在「忙碌」状态（否则摘取按钮永久禁用）
+  window.addEventListener('unhandledrejection', (e) => {
+    console.error('[unhandled]', e.reason);
+    if (state.busy) setBusy(false);
+    toast('操作出错：' + ((e.reason && (e.reason.message || e.reason)) || '未知错误'), 'err');
+  });
   state.config = (await api.getConfig()).config || {};
   state.panes.left = new Pane('left');
   state.panes.right = new Pane('right');

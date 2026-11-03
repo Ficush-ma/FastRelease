@@ -325,13 +325,26 @@ async function listCommits(dir, { ref, limit = 200, skip = 0, search = '', since
 }
 
 /**
- * 用 git cherry 标记「补丁已存在于目标分支」的提交
+ * 用 git cherry 标记「补丁已存在于目标分支」的提交。
+ * 大仓库上 cherry 全量比对极慢（几万提交要几分钟），这里只比对源分支最近的
+ * limitCommits 个提交——界面上每页最多也就看几百个，够用且快一个数量级。
  */
-async function cherryFlags(dir, { target, source }) {
+async function cherryFlags(dir, { target, source, limitCommits = 300 }) {
   const repo = await ensureRepo(dir);
   if (!repo.ok) return repo;
   if (!target || !source) return { ok: true, map: {} };
-  const r = await run(repo.root, ['cherry', target, source], { timeout: 60000 });
+  const root = repo.root;
+
+  // 基点必须取自「源分支自己」的历史，否则不会起到限制作用
+  let limitRef = '';
+  if (limitCommits > 0) {
+    const baseR = await run(root, ['rev-list', '-1', '--skip=' + limitCommits, source], { timeout: 20000 });
+    if (baseR.ok) limitRef = baseR.stdout.trim();
+  }
+  const args = ['cherry', target, source];
+  if (limitRef) args.push(limitRef);
+
+  const r = await run(root, args, { timeout: 60000 });
   if (!r.ok) return { ok: true, map: {}, warning: mergeOutput(r) };
   const map = {};
   for (const line of r.stdout.split('\n')) {
