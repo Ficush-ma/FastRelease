@@ -2,7 +2,7 @@
 
 给「dev 开发 → release 上线」这套 cherry-pick 流程用的桌面小工具。左右两栏分别放两个分支的提交，勾选左边几个提交，一次摘取到右边，然后一键推送。
 
-界面和交互参照 TortoiseGit：浅色、紧凑、工具栏 + 列表，冲突解决参照 TortoiseGitMerge 的三栏对照。
+EXE版本下载:[https://github.com/Ficush-ma/FastRelease/releases/download](https://github.com/Ficush-ma/FastRelease/releases)
 
 ## 启动
 
