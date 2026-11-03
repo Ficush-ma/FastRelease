@@ -26,26 +26,26 @@ git push -q -u origin master
 mkref master "$(git rev-parse master)"
 
 # 远端 dev 分支（本地建完就删，保证只存在于远端）
-git checkout -q -b dev-test
+git checkout -q -b dev-20251112
 printf "base\ndev-feature\n" > a.txt
 git add .
 git commit -qm "fix: dev 修改 a.txt 第二行"
 printf "feature d1\n" > d1.txt
 git add .
 git commit -qm "feat: dev 新增 D1 模块"
-DEV_SHA=$(git rev-parse dev-test)
-git push -q -u origin dev-test
-mkref dev-test "$DEV_SHA"
+DEV_SHA=$(git rev-parse dev-20251112)
+git push -q -u origin dev-20251112
+mkref dev-20251112 "$DEV_SHA"
 git checkout -q master
-git branch -q -D dev-test
+git branch -q -D dev-20251112
 
 # 本地 release 分支
-git checkout -q -b release-test
+git checkout -q -b release-1028
 printf "release-only\n" > r.txt
 git add .
 git commit -qm "chore: release 初始化"
-git push -q -u origin release-test
-mkref release-test "$(git rev-parse release-test)"
+git push -q -u origin release-1028
+mkref release-1028 "$(git rev-parse release-1028)"
 
 # 本地先摘一个 dev 提交（模拟已经 cherry-pick 过）
 D1=$(git log "$DEV_SHA" --format=%H --grep="dev 修改 a.txt" -n1)
@@ -60,19 +60,19 @@ git clone -q ../.fxremote.git ../.fxother
 cd ../.fxother
 git config user.name "Other"
 git config user.email "o@example.com"
-git checkout -q release-test
+git checkout -q release-1028
 printf "base\nremote-change\n" > a.txt
 printf "other\n" > o.txt
 git add .
 git commit -qm "hotfix: 远端修复 a.txt"
-git push -q origin release-test
-OTHER_SHA=$(git rev-parse release-test)
+git push -q origin release-1028
+OTHER_SHA=$(git rev-parse release-1028)
 
 cd "$ROOT/.fxrepo"
 git fetch -q origin 2>/dev/null || true   # 先把对象拉下来（本机 refs/remotes 写不进去，下面手工补）
-mkref release-test "$OTHER_SHA"
-git checkout -q release-test
+mkref release-1028 "$OTHER_SHA"
+git checkout -q release-1028
 echo "fixture ready"
-echo "本地 release-test:"; git log --oneline -3
-echo "远端 release-test:"; git log --oneline -3 "$OTHER_SHA"
+echo "本地 release-1028:"; git log --oneline -3
+echo "远端 release-1028:"; git log --oneline -3 "$OTHER_SHA"
 echo "远端 dev:"; git log --oneline -3 "$DEV_SHA"

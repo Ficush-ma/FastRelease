@@ -254,29 +254,21 @@ async function listCommits(dir, { ref, limit = 200, skip = 0, search = '', since
   if (!ref) return { ok: false, error: '请选择分支' };
 
   const fmt = ['%H', '%h', '%an', '%ae', '%ad', '%ct', '%P', '%D', '%s'].join('%x1f');
-  const args = ['log', ref, '--date=iso-strict', '--pretty=format:' + fmt];
   const kw = (search || '').trim();
   const isHashLike = /^[0-9a-fA-F]{4,40}$/.test(kw);
 
-  let useClientFilter = false;
-  if (kw && !isHashLike) {
-    args.push('-i', '--grep=' + kw, '--fixed-strings');
-  } else if (kw && isHashLike) {
-    useClientFilter = true;
-  }
-  if (since) args.push('--since=' + since);
-  if (until) args.push('--until=' + until);
-  if (author) args.push('--author=' + author);
+  const buildArgs = (useGrep, pageLimit, pageSkip) => {
+    const args = ['log', ref, '--date=iso-strict', '--pretty=format:' + fmt];
+    if (kw && useGrep) args.push('-i', '--grep=' + kw, '--fixed-strings');
+    if (since) args.push('--since=' + since);
+    if (until) args.push('--until=' + until);
+    if (author) args.push('--author=' + author);
+    args.push('-n', String(pageLimit));
+    if (pageSkip > 0) args.push('--skip', String(pageSkip));
+    return args;
+  };
 
-  const pageLimit = useClientFilter ? 5000 : limit;
-  const pageSkip = useClientFilter ? 0 : skip;
-  args.push('-n', String(pageLimit));
-  if (pageSkip > 0) args.push('--skip', String(pageSkip));
-
-  const r = await run(root, args, { timeout: 60000 });
-  if (!r.ok) return { ok: false, error: mergeOutput(r) || '读取提交失败' };
-
-  let commits = r.stdout.split('\n').filter(Boolean).map((line) => {
+  const parse = (stdout) => stdout.split('\n').filter(Boolean).map((line) => {
     const f = line.split(SEP);
     const parents = (f[6] || '').trim().split(/\s+/).filter(Boolean);
     return {
@@ -293,16 +285,43 @@ async function listCommits(dir, { ref, limit = 200, skip = 0, search = '', since
     };
   });
 
-  // --author 是子串/正则匹配，再精确过滤一次，避免 "Bob" 匹配到 "Bob Lee"
-  if (author) commits = commits.filter((c) => c.author === author);
+  const exactAuthor = (list) => {
+    // --author 是子串/正则匹配，再精确过滤一次，避免 "Bob" 匹配到 "Bob Lee"
+    return author ? list.filter((c) => c.author === author) : list;
+  };
 
-  if (useClientFilter) {
+  const fetch = async (useGrep, pageLimit, pageSkip) => {
+    const r = await run(root, buildArgs(useGrep, pageLimit, pageSkip), { timeout: 60000 });
+    if (!r.ok) return { ok: false, error: mergeOutput(r) || '读取提交失败' };
+    return { ok: true, commits: parse(r.stdout) };
+  };
+
+  let commits;
+  let hasMore;
+
+  if (kw && isHashLike) {
+    // 像哈希的关键字：先按哈希前缀匹配；匹配不到（多半是 storyid/工单号这类数字）
+    // 自动降级为普通文本搜索，两种语义都覆盖。
+    const first = await fetch(false, 5000, 0);
+    if (!first.ok) return first;
     const low = kw.toLowerCase();
-    commits = commits.filter((c) => c.hash.toLowerCase().startsWith(low));
-    commits = commits.slice(skip, skip + limit);
+    const byHash = first.commits.filter((c) => c.hash.toLowerCase().startsWith(low));
+    if (byHash.length) {
+      commits = exactAuthor(byHash).slice(skip, skip + limit);
+      return { ok: true, commits, hasMore: false };
+    }
+    const second = await fetch(true, limit, skip);
+    if (!second.ok) return second;
+    commits = exactAuthor(second.commits);
+    hasMore = commits.length >= limit;
+  } else {
+    const r = await fetch(!!kw, limit, skip);
+    if (!r.ok) return r;
+    commits = exactAuthor(r.commits);
+    hasMore = commits.length >= limit;
   }
 
-  return { ok: true, commits, hasMore: useClientFilter ? false : commits.length >= limit };
+  return { ok: true, commits, hasMore };
 }
 
 /**
