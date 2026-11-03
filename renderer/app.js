@@ -266,9 +266,13 @@ class Pane {
       } else {
         this.customRange.classList.add('hidden');
         this.load(true);
+        refreshFlags(); // 徽标口径跟随时间窗口
       }
     });
-    $('.apply-range', this.el).addEventListener('click', () => this.load(true));
+    $('.apply-range', this.el).addEventListener('click', () => {
+      this.load(true);
+      refreshFlags();
+    });
     $('.cancel-range', this.el).addEventListener('click', () => {
       this.customRange.classList.add('hidden');
       this.timeSelect.value = this.timeRange;
@@ -758,16 +762,40 @@ async function loadAheads() {
   updatePaneAhead();
 }
 
+/**
+ * 计算两栏的「已摘取」徽标。
+ * 口径与列表筛选一致：用每栏自己的时间窗口（「全部时间」时后端封顶 90 天）。
+ * 后端按分支 tip + 窗口做 patch-id 索引缓存，分支没动时第二次是毫秒级。
+ */
 async function refreshFlags() {
   const left = state.panes.left;
   const right = state.panes.right;
   if (!left || !right || !left.branch || !right.branch) return;
-  const [fwd, back] = await Promise.all([
-    api.cherryFlags({ dir: state.dir, target: right.branch, source: left.branch }),
-    api.cherryFlags({ dir: state.dir, target: left.branch, source: right.branch })
-  ]);
-  left.pickedMap = (fwd && fwd.ok && fwd.map) || {};
-  right.pickedMap = (back && back.ok && back.map) || {};
+
+  const runOne = async (pane, other) => {
+    if (pane.branch === other.branch) {
+      pane.pickedMap = {};
+      pane.render();
+      return;
+    }
+    const bounds = pane.timeBounds();
+    const source = pane.branch;
+    const res = await api.patchFlags({
+      dir: state.dir,
+      source,
+      target: other.branch,
+      since: bounds.since || '',
+      until: bounds.until || ''
+    });
+    // 期间切了分支就丢弃过期结果
+    if (pane.branch !== source) return;
+    if (res && res.ok) {
+      pane.pickedMap = res.map || {};
+      pane.render();
+    }
+  };
+
+  await Promise.all([runOne(left, right), runOne(right, left)]);
 }
 
 async function refreshAll(opts = {}) {

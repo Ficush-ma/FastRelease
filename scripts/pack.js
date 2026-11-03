@@ -80,7 +80,12 @@ const newExe = path.join(OUT_DIR, 'FastRelease.exe');
 if (!fs.existsSync(newExe)) fail('没有生成 FastRelease.exe，请检查 Electron 运行时是否完整');
 
 console.log('3/4 写入应用代码…');
-if (!tryRemove(APP_DIR)) fail('无法清空 resources/app，请手动删除后重试');
+if (fs.existsSync(APP_DIR) && !tryRemove(APP_DIR)) {
+  // 某些环境拦删除：先改名让路，旧的留着也无妨（下次清理）
+  const parked = APP_DIR + '.old-' + Date.now();
+  try { fs.renameSync(APP_DIR, parked); } catch (_) { /* ignore */ }
+}
+if (fs.existsSync(APP_DIR)) fail('无法清空 resources/app，请手动删除后重试');
 fs.mkdirSync(APP_DIR, { recursive: true });
 
 for (const f of COPY_LIST) copyFile(path.join(ROOT, f), path.join(APP_DIR, f));

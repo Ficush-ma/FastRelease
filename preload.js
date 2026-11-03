@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('api', {
   branches: (dir) => invoke('repo:branches', { dir }),
   commits: (payload) => invoke('repo:commits', payload),
   cherryFlags: (payload) => invoke('repo:cherryFlags', payload),
+  patchFlags: (payload) => invoke('repo:patchFlags', payload),
   branchAhead: (dir, branch) => invoke('repo:ahead', { dir, branch }),
   pull: (dir, branch, mode) => invoke('repo:pull', { dir, branch, mode }),
   push: (dir, branch) => invoke('repo:push', { dir, branch }),

@@ -328,6 +328,7 @@ async function listCommits(dir, { ref, limit = 200, skip = 0, search = '', since
  * 用 git cherry 标记「补丁已存在于目标分支」的提交。
  * 大仓库上 cherry 全量比对极慢（几万提交要几分钟），这里只比对源分支最近的
  * limitCommits 个提交——界面上每页最多也就看几百个，够用且快一个数量级。
+ * 注意：新界面已改用 patchFlags（按时间窗口 + 索引缓存），此函数保留兼容。
  */
 async function cherryFlags(dir, { target, source, limitCommits = 300 }) {
   const repo = await ensureRepo(dir);
@@ -355,6 +356,140 @@ async function cherryFlags(dir, { target, source, limitCommits = 300 }) {
     if (sign === '-') map[sha] = true;
   }
   return { ok: true, map };
+}
+
+/* ---------------------- patch-id 索引（「已摘取」标记） ---------------------- */
+
+const BADGE_MAX_DAYS = 90;
+// 缓存：root|ref|since|until -> { tip, shaToPatch, patchToShas }
+const patchIndexCache = new Map();
+
+/** 跑 `git log ... -p | git patch-id --stable`，把提交映射到 patch-id */
+function runPipe(cwd, logArgs, opts = {}) {
+  const timeout = opts.timeout || 180000;
+  return new Promise((resolve) => {
+    let settled = false;
+    let out = '';
+    let err = '';
+    let timer = null;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ ok, stdout: out, stderr: err });
+    };
+    let a;
+    let b;
+    const env = { ...process.env, GIT_PAGER: 'cat', GIT_TERMINAL_PROMPT: '0' };
+    try {
+      a = spawn('git', ['-c', 'core.quotepath=false', ...logArgs], { cwd, windowsHide: true, env });
+      b = spawn('git', ['patch-id', '--stable'], { cwd, windowsHide: true, env });
+    } catch (e) {
+      resolve({ ok: false, stdout: '', stderr: String((e && e.message) || e) });
+      return;
+    }
+    a.stdout.pipe(b.stdin);
+    a.stderr.on('data', (d) => { err += d; });
+    b.stdout.on('data', (d) => { out += d; });
+    b.stderr.on('data', (d) => { err += d; });
+    a.on('error', (e) => { err += String((e && e.message) || e); done(false); });
+    b.on('error', (e) => { err += String((e && e.message) || e); done(false); });
+    a.on('close', () => { try { b.stdin.end(); } catch (_) { /* ignore */ } });
+    b.on('close', (code) => done(code === 0));
+    timer = setTimeout(() => {
+      try { a.kill(); } catch (_) { /* ignore */ }
+      try { b.kill(); } catch (_) { /* ignore */ }
+      done(false);
+    }, timeout);
+  });
+}
+
+async function buildPatchIndex(root, ref, { since, until, exclude } = {}) {
+  const args = ['log', ref, '--no-merges', '--pretty=format:commit %H', '-p'];
+  if (exclude) args.push('^' + exclude);
+  if (since) args.push('--since=' + since);
+  if (until) args.push('--until=' + until);
+
+  const r = await runPipe(root, args, { timeout: 180000 });
+  const shaToPatch = new Map();
+  const patchToShas = new Map();
+  if (r.ok) {
+    for (const line of r.stdout.split('\n')) {
+      const m = line.trim().match(/^([0-9a-f]{40})\s+([0-9a-f]{40})$/);
+      if (!m) continue;
+      const pid = m[1];
+      const sha = m[2];
+      shaToPatch.set(sha, pid);
+      if (!patchToShas.has(pid)) patchToShas.set(pid, []);
+      patchToShas.get(pid).push(sha);
+    }
+  }
+  return { ok: r.ok, shaToPatch, patchToShas, error: r.ok ? '' : (r.stderr || 'patch-id 计算失败') };
+}
+
+/** 取某个分支在时间窗口内的 patch-id 索引（带缓存 + 增量更新） */
+async function getPatchIndex(root, ref, { since, until }) {
+  const tipR = await run(root, ['rev-parse', ref], { timeout: 20000 });
+  const tip = tipR.ok ? tipR.stdout.trim() : '';
+  const key = [root, ref, since || '', until || ''].join('|');
+  const cached = patchIndexCache.get(key);
+
+  if (cached && cached.tip === tip) return { ok: true, ...cached, cached: true };
+
+  if (cached && cached.tip && tip) {
+    // 增量：分支只是往前走，就只补算新提交
+    const anc = await run(root, ['merge-base', '--is-ancestor', cached.tip, tip], { timeout: 20000 });
+    if (anc.ok) {
+      const inc = await buildPatchIndex(root, tip, { since, until, exclude: cached.tip });
+      if (inc.ok) {
+        for (const [sha, pid] of inc.shaToPatch) {
+          cached.shaToPatch.set(sha, pid);
+          if (!cached.patchToShas.has(pid)) cached.patchToShas.set(pid, []);
+          cached.patchToShas.get(pid).push(sha);
+        }
+        cached.tip = tip;
+        return { ok: true, ...cached, cached: false, incremental: true };
+      }
+    }
+  }
+
+  const fresh = await buildPatchIndex(root, tip || ref, { since, until });
+  if (!fresh.ok) return { ok: false, error: fresh.error };
+  const entry = { tip, shaToPatch: fresh.shaToPatch, patchToShas: fresh.patchToShas };
+  patchIndexCache.set(key, entry);
+  return { ok: true, ...entry, cached: false };
+}
+
+/**
+ * 「已摘取」标记：源分支窗口内的提交，其 patch 是否已出现在目标分支窗口内。
+ * 口径与界面筛选一致（同一 since/until，未指定时间时封顶 90 天）。
+ */
+async function patchFlags(dir, { source, target, since, until }) {
+  const repo = await ensureRepo(dir);
+  if (!repo.ok) return repo;
+  if (!source || !target || source === target) return { ok: true, map: {} };
+  const root = repo.root;
+
+  const from = since || new Date(Date.now() - BADGE_MAX_DAYS * 864e5).toISOString();
+  const [srcIdx, dstIdx] = await Promise.all([
+    getPatchIndex(root, source, { since: from, until: until || '' }),
+    getPatchIndex(root, target, { since: from, until: until || '' })
+  ]);
+  if (!srcIdx.ok || !dstIdx.ok) {
+    return { ok: false, error: srcIdx.error || dstIdx.error || '索引计算失败' };
+  }
+
+  const map = {};
+  for (const [sha, pid] of srcIdx.shaToPatch) {
+    if (dstIdx.patchToShas.has(pid)) map[sha] = true;
+  }
+  return {
+    ok: true,
+    map,
+    window: { since: from, until: until || '' },
+    counts: { source: srcIdx.shaToPatch.size, target: dstIdx.shaToPatch.size },
+    cached: srcIdx.cached && dstIdx.cached
+  };
 }
 
 async function branchRemote(dir, branch) {
@@ -919,6 +1054,7 @@ module.exports = {
   listBranches,
   listCommits,
   cherryFlags,
+  patchFlags,
   branchAheadBehind,
   pullBranch,
   pushBranch,

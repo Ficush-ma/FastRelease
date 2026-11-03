@@ -126,6 +126,7 @@ handle('repo:branches', (p) => git.listBranches(p.dir));
 handle('repo:commits', (p) => git.listCommits(p.dir, p));
 
 handle('repo:cherryFlags', (p) => git.cherryFlags(p.dir, p));
+handle('repo:patchFlags', (p) => git.patchFlags(p.dir, p));
 
 handle('repo:ahead', (p) => git.branchAheadBehind(p.dir, p.branch));
 
