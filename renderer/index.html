@@ -49,6 +49,7 @@
     <div class="tabbar">
       <button class="tab active" data-tab="merge">快速合并</button>
       <button class="tab" data-tab="check">合并检查</button>
+      <button class="tab" data-tab="fix">代码修复快速合并</button>
     </div>
 
     <!-- ======== 双栏提交视图 ======== -->
@@ -231,6 +232,49 @@
       </div>
     </main>
 
+    <!-- ======== 代码修复快速合并：左栏复用提交列表，右栏多选目标分支 ======== -->
+    <main class="panes hidden" id="viewFix">
+      <div class="pane-host" id="fixPaneHost"></div>
+
+      <div class="transfer">
+        <button id="btnFixPick" class="xfer-btn" disabled title="把左侧勾选的提交摘取到右侧勾选的所有分支">
+          <span class="xfer-arrow">→</span>
+          <span class="xfer-text">摘取</span>
+          <span class="xfer-count">0</span>
+        </button>
+        <button id="btnFixPickPush" class="xfer-btn secondary" disabled title="每个分支摘取成功后立即推送">
+          <span class="xfer-arrow">→</span>
+          <span class="xfer-text">摘取并推送</span>
+          <span class="xfer-count">0</span>
+        </button>
+        <div class="xfer-hint">摘取到<br />选中的分支</div>
+      </div>
+
+      <section class="pane fix-right">
+        <div class="pane-head">
+          <div class="pane-title-row">
+            <span class="pane-tag">目标分支</span>
+            <span class="pane-sub" id="fixSelCount">未选择分支</span>
+            <span class="spacer"></span>
+            <button id="btnFixAll" class="btn tiny">全选</button>
+            <button id="btnFixNone" class="btn tiny">清空</button>
+          </div>
+          <div class="pane-filter-row">
+            <div class="search-box">
+              <svg viewBox="0 0 16 16" width="12" height="12"><circle cx="7" cy="7" r="4.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m10.2 10.2 3 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+              <input id="fixSearch" class="search-input" spellcheck="false" placeholder="搜索分支名" />
+              <button class="search-clear" id="fixSearchClear" title="清除">×</button>
+            </div>
+          </div>
+        </div>
+        <div class="fix-branch-list" id="fixBranchList"></div>
+        <div class="fix-result hidden" id="fixResult"></div>
+        <div class="pane-foot">
+          <span class="foot-tip" id="fixTip">勾选一个或多个分支</span>
+        </div>
+      </section>
+    </main>
+
     <!-- ======== 底部状态栏 ======== -->
     <footer class="statusbar">
       <div class="status-left">
@@ -334,6 +378,27 @@
   </div>
 
   <div id="toasts" class="toasts"></div>
+
+  <!-- ======== 工作区改动 ======== -->
+  <div id="workView" class="overlay hidden">
+    <div class="work-panel">
+      <div class="work-head">
+        <strong>工作区改动</strong>
+        <span id="workCount" class="work-sub"></span>
+        <span class="spacer"></span>
+        <button id="workClose" class="btn small">关闭</button>
+      </div>
+      <div class="work-body">
+        <div id="workList" class="work-list"></div>
+        <pre id="workDiff" class="work-diff">从左侧选择一个文件查看改动</pre>
+      </div>
+      <div class="work-foot">
+        <span class="work-tip">这些改动未提交。摘取或拉取时会自动暂存，操作完成后自动恢复。</span>
+        <span class="spacer"></span>
+        <button id="workRestore" class="btn small hidden">恢复暂存的改动</button>
+      </div>
+    </div>
+  </div>
 
   <div id="modal" class="modal-backdrop hidden">
     <div class="modal">

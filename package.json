@@ -1,6 +1,6 @@
 {
   "name": "fast-release",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "description": "FastRelease - 分支提交摘取与推送工具（dev -> release cherry-pick 工作流）",
   "main": "main.js",
   "author": "FastRelease",

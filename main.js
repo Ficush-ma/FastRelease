@@ -127,10 +127,28 @@ handle('repo:commits', (p) => git.listCommits(p.dir, p));
 
 handle('repo:cherryFlags', (p) => git.cherryFlags(p.dir, p));
 handle('repo:patchFlags', (p) => git.patchFlags(p.dir, p));
+handle('repo:workingChanges', (p) => git.workingChanges(p.dir));
+
+/** 渲染层错误落盘，方便远程排查“点了没反应”这类问题 */
+handle('app:logError', (p) => {
+  try {
+    ensureDataDir();
+    const line = '[' + new Date().toISOString() + '] ' + (p.kind || 'error') + ': ' + (p.message || '') + '\n' +
+      (p.stack ? p.stack + '\n' : '') + '---\n';
+    fs.appendFileSync(path.join(DATA_DIR, 'renderer-error.log'), line);
+    return { ok: true, file: path.join(DATA_DIR, 'renderer-error.log') };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+});
+handle('repo:workingDiff', (p) => git.workingDiff(p.dir, p));
+handle('repo:stashPop', (p) => git.stashPop(p.dir));
+handle('repo:stashFinish', (p) => git.stashFinish(p.dir));
+handle('repo:stashAbort', (p) => git.stashAbort(p.dir));
 
 handle('repo:ahead', (p) => git.branchAheadBehind(p.dir, p.branch));
 
-handle('repo:pull', (p) => git.pullBranch(p.dir, { branch: p.branch, mode: p.mode }));
+handle('repo:pull', (p) => git.pullBranch(p.dir, { branch: p.branch, mode: p.mode, autoStash: !!p.autoStash }));
 
 handle('repo:push', (p) => git.pushBranch(p.dir, p.branch));
 

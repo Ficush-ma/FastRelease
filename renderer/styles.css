@@ -174,6 +174,9 @@ body {
 }
 .chip.branch { background: #eaf2fe; border-color: #c3d9f4; color: #0a4d9e; font-weight: 600; }
 .chip.dirty { background: #fff4e5; border-color: #f0d3a8; color: #91590a; }
+.chip.clickable { cursor: pointer; }
+.chip.clean.clickable:hover { background: #e2f3e7; border-color: #b3dcbf; }
+.chip.dirty.clickable:hover { background: #ffe9c9; border-color: #e5bd83; }
 .chip.clean { background: #eef8f0; border-color: #c8e6cf; color: #1f7a3d; }
 .chip .up { color: #0a63c9; font-weight: 600; }
 .chip .down { color: #b26a00; font-weight: 600; }
@@ -201,6 +204,69 @@ body {
 }
 
 /* ================= 双栏 ================= */
+/* 代码修复快速合并：左栏节点会被移动到 pane-host 里，用 display:contents 让它保持原网格位置 */
+.pane-host { display: contents; }
+.pane-sub { font-size: 12px; color: #6b7280; margin-left: 4px; }
+.fix-branch-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: #fbfcfd;
+}
+.fix-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #eef1f5;
+}
+.fix-row:hover { background: #eef4fd; }
+.fix-row.checked { background: #dbe9fb; }
+.fix-row.disabled { opacity: 0.55; cursor: default; }
+.fix-row.disabled:hover { background: transparent; }
+.fix-row input[type="checkbox"] { margin: 0; flex: none; }
+.fix-row .fix-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: Consolas, monospace;
+}
+.fix-row .fix-up { flex: none; color: #8b929c; font-size: 11px; }
+.fix-empty { padding: 18px 12px; color: #8b929c; font-size: 12px; text-align: center; }
+.fix-result {
+  flex: none;
+  max-height: 168px;
+  overflow: auto;
+  border-top: 1px solid #dde1e7;
+  background: #f7f8fa;
+  padding: 6px 10px;
+}
+.fix-result-title { font-size: 12px; color: #5f6671; margin-bottom: 4px; }
+.fix-result-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+  padding: 2px 0;
+}
+.fix-result-row .fix-res-branch {
+  flex: none;
+  width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: Consolas, monospace;
+}
+.fix-result-row .fix-res-state { flex: none; }
+.fix-result-row .fix-res-msg { flex: 1 1 auto; min-width: 0; color: #8b929c; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fix-result-row.ok .fix-res-state { color: #1f7a3d; }
+.fix-result-row.warn .fix-res-state { color: #b26a00; }
+.fix-result-row.bad .fix-res-state { color: #c22d2d; }
+
 .panes {
   flex: 1 1 auto;
   min-height: 0;
@@ -426,6 +492,7 @@ body {
   border: 1px solid transparent;
 }
 .badge.picked { background: #eaf6ec; border-color: #bfe0c6; color: #226c3b; }
+.badge.picked.squash { background: #eef4fd; border-color: #c3d9f4; color: #0a4d9e; }
 .badge.merge { background: #eef1f6; border-color: #d7dce4; color: #55606e; }
 .badge.head { background: #eaf2fe; border-color: #c3d9f4; color: #0a4d9e; }
 .badge.remote { background: #f5f1fb; border-color: #ded3f0; color: #5b3f92; }
@@ -696,6 +763,9 @@ body {
 }
 .badge.merged { background: #eaf6ec; border-color: #bfe0c6; color: #226c3b; }
 .badge.unmerged { background: #fdecec; border-color: #f0c2c2; color: #a11f1f; }
+.badge.merged.squash { background: #eef4fd; border-color: #c3d9f4; color: #0a4d9e; }
+.badge.maybe { background: #fdf3e3; border-color: #f0d3a8; color: #8a5606; }
+.num-warn { color: #8a5606; }
 
 .ck-dirty { color: #8a5606; font-size: 12px; margin-left: 8px; }
 .ck-dirty.hidden { display: none; }
@@ -834,6 +904,123 @@ body {
   flex-direction: column;
   background: var(--bg);
 }
+
+/* ================= 工作区改动 ================= */
+#workView {
+  background: rgba(0, 0, 0, 0.28);
+  align-items: center;
+  justify-content: center;
+}
+.work-panel {
+  width: min(1080px, 92vw);
+  height: min(720px, 86vh);
+  background: #fff;
+  border: 1px solid #c4ccd8;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+}
+.work-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #dde1e7;
+  background: #f7f8fa;
+}
+.work-head strong { font-size: 13px; font-weight: 500; }
+.work-sub { font-size: 12px; color: #6b7280; }
+.work-head .spacer { flex: 1; }
+.work-body { flex: 1; display: flex; min-height: 0; }
+.work-list {
+  width: 320px;
+  flex: none;
+  border-right: 1px solid #dde1e7;
+  overflow: auto;
+  background: #fbfcfd;
+}
+.work-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 1px solid #eef1f5;
+}
+.work-item:hover { background: #eef4fd; }
+.work-item.active { background: #dbe9fb; }
+.work-item .wcode {
+  flex: none;
+  font-family: Consolas, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  width: 22px;
+  text-align: center;
+  border-radius: 3px;
+  color: #fff;
+  background: #8a94a6;
+}
+.work-item .wcode.mod { background: #c98a00; }
+.work-item .wcode.add { background: #2f8f4e; }
+.work-item .wcode.del { background: #b3322f; }
+.work-item .wcode.unt { background: #6b7280; }
+.work-item .wname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: Consolas, monospace;
+}
+.work-diff {
+  flex: 1;
+  margin: 0;
+  padding: 8px 0;
+  overflow: auto;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #1f2937;
+  white-space: pre;
+}
+/* 改动行高亮：整行底色 + 左侧竖条，颜色沿用 --ok / --danger / --accent */
+.work-diff .dl {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  padding: 0 12px 0 9px;
+  border-left: 3px solid transparent;
+}
+.work-diff .dl.add {
+  background: #e9f7ee;
+  border-left-color: #2f8f4e;
+  color: #1c6b3a;
+}
+.work-diff .dl.del {
+  background: #fdecec;
+  border-left-color: #b3322f;
+  color: #a32b28;
+}
+.work-diff .dl.hunk {
+  background: #eef4fd;
+  border-left-color: #7fb0e8;
+  color: #0a63c9;
+}
+.work-diff .dl.head { color: #8b929c; }
+.work-diff .dl.meta { color: #8b929c; }
+.work-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-top: 1px solid #dde1e7;
+  background: #f7f8fa;
+}
+.work-tip { font-size: 12px; color: #6b7280; }
+.work-foot .spacer { flex: 1; }
 
 .merge-toolbar {
   flex: none;
@@ -1181,3 +1368,10 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover { background: #a9b1bb; }
 ::-webkit-scrollbar-corner { background: #f6f7f9; }
+
+/* 「已摘取」徽标正在计算时的提示 */
+.pane.flagging .pane-tag::after {
+  content: " · 判定中…";
+  color: #8b929c;
+  font-weight: 400;
+}

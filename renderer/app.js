@@ -18,6 +18,7 @@ const state = {
   config: {},
   busy: false,
   tab: 'merge',
+  stashDeferred: false,
   panes: {},
   merge: {
     active: false,
@@ -29,7 +30,11 @@ const state = {
     others: [],
     current: null,
     pendingPush: false,
-    pushSide: ''
+    pendingStash: false,
+    pushSide: '',
+    fixQueue: false,
+    fixBranch: '',
+    fixItem: null
   }
 };
 
@@ -205,6 +210,7 @@ class Pane {
     this.behind = 0;
     this.lastIndex = -1;
     this.pickedMap = {};
+    this.squashMap = {};
     this.limit = 200;
     this.hasMore = false;
     this.branch = '';
@@ -470,7 +476,12 @@ class Pane {
       const sel = this.selected.has(c.hash);
       const picked = !!this.pickedMap[c.hash];
       const badges = [];
-      if (picked) badges.push(`<span class="badge picked" title="对侧分支已存在等价提交（git cherry 判定）">${this.pickedLabel}</span>`);
+      if (picked) {
+        const sq = !!this.squashMap[c.hash];
+        badges.push(sq
+          ? `<span class="badge picked squash" title="对侧分支的文件内容已包含该提交的改动（squash 合并判定）">${this.pickedLabel}</span>`
+          : `<span class="badge picked" title="对侧分支已存在等价提交（patch-id 判定）">${this.pickedLabel}</span>`);
+      }
       if (c.isMerge) badges.push('<span class="badge merge">合并</span>');
       if (curBranch && this.branch === curBranch && i === 0) badges.push('<span class="badge head">HEAD</span>');
       return (
@@ -542,11 +553,13 @@ function updateHeadInfo() {
     );
   }
   if (info.dirty.length) {
-    parts.push(`<span class="chip dirty" title="${escapeHtml(info.dirty.slice(0, 20).map((d) => d.code + ' ' + d.path).join('\n'))}">工作区 ${info.dirty.length} 处改动</span>`);
+    parts.push(`<span class="chip dirty clickable" id="dirtyChip" title="点击查看改动文件">工作区 ${info.dirty.length} 处改动</span>`);
   } else {
-    parts.push('<span class="chip clean">工作区干净</span>');
+    parts.push('<span class="chip clean clickable" id="dirtyChip" title="点击查看工作区（当前没有未提交改动）">工作区干净</span>');
   }
   box.innerHTML = parts.join('');
+  const chip = $('#dirtyChip');
+  if (chip) chip.addEventListener('click', openWorkView);
 
   const rs = [];
   rs.push(`当前分支：${info.branch}`);
@@ -642,6 +655,7 @@ function updateTransferUI() {
     btn.title = '先在左右任一栏勾选提交';
   }
   $('#btnClearSel').disabled = !(ls || rs);
+  updateFixButtons();
 }
 
 /* -------------------------- 仓库加载 -------------------------- */
@@ -770,28 +784,49 @@ async function loadAheads() {
 async function refreshFlags() {
   const left = state.panes.left;
   const right = state.panes.right;
-  if (!left || !right || !left.branch || !right.branch) return;
+  if (!left || !left.branch) return;
+
+  // 批量页有多个目标分支，单个「已摘取」口径没有意义，统一不显示徽标
+  if (currentTab() === 'fix') {
+    left.pickedMap = {};
+    left.squashMap = {};
+    left.render();
+    return;
+  }
+
+  if (!right || !right.branch) return;
 
   const runOne = async (pane, other) => {
     if (pane.branch === other.branch) {
       pane.pickedMap = {};
+      pane.squashMap = {};
       pane.render();
       return;
     }
     const bounds = pane.timeBounds();
     const source = pane.branch;
-    const res = await api.patchFlags({
-      dir: state.dir,
-      source,
-      target: other.branch,
-      since: bounds.since || '',
-      until: bounds.until || ''
-    });
-    // 期间切了分支就丢弃过期结果
-    if (pane.branch !== source) return;
-    if (res && res.ok) {
-      pane.pickedMap = res.map || {};
-      pane.render();
+    pane.el.classList.add('flagging');
+    try {
+      // 只判当前列表里的提交：结果稳定、耗时可控（深层判定按条数给预算）
+      const res = await api.patchFlags({
+        dir: state.dir,
+        source,
+        target: other.branch,
+        since: bounds.since || '',
+        until: bounds.until || '',
+        only: (pane.commits || []).map((c) => c.hash)
+      });
+      // 期间切了分支就丢弃过期结果
+      if (pane.branch !== source) return;
+      if (res && res.ok) {
+        pane.pickedMap = res.map || {};
+        pane.squashMap = (res && res.squash) || {};
+        pane.render();
+      }
+    } catch (e) {
+      try { api.logError({ kind: 'rejection', message: '刷新已摘取标记失败：' + ((e && e.message) || e) }); } catch (_) { /* ignore */ }
+    } finally {
+      pane.el.classList.remove('flagging');
     }
   };
 
@@ -817,6 +852,7 @@ async function refreshAll(opts = {}) {
     updateTransferUI();
   }
   if (opts.reselect) updateTransferUI();
+  if (currentTab() === 'fix') await initFixView();
 }
 
 async function refreshInfoOnly() {
@@ -834,15 +870,33 @@ async function doPull(side) {
   const pane = state.panes[side];
   if (!pane.branch) return;
   const mode = state.config.pullMode || 'rebase';
-  if (pane.isRemote) setBusy(true, `正在更新远端引用 ${pane.branch}…`);
-  else setBusy(true, mode === 'rebase' ? `正在变基 ${pane.branch}…` : `正在拉取 ${pane.branch}…`);
 
-  const res = await api.pull(state.dir, pane.branch, mode);
+  // 工作区有改动且拉的是当前分支：确认后自动暂存，拉完恢复
+  const isCurrent = state.info && state.info.ok && state.info.branch === pane.branch;
+  const dirty = state.info && state.info.dirty ? state.info.dirty.length : 0;
+  let autoStash = false;
+  if (!pane.isRemote && isCurrent && dirty) {
+    autoStash = await modalConfirm(
+      '工作区有未提交改动',
+      `当前工作区有 <b>${dirty}</b> 处未提交改动。<br />` +
+      `继续将执行：<b>git stash push -u</b> 暂存 → ${mode === 'rebase' ? '变基' : '拉取'} → 自动恢复改动。<br />` +
+      `如果变基过程中出现冲突，改动会一直保留在 stash 里，等你解决完并继续（或中止）之后再恢复。`,
+      '暂存并继续'
+    );
+    if (!autoStash) return;
+  }
+
+  if (pane.isRemote) setBusy(true, `正在更新远端引用 ${pane.branch}…`);
+  else setBusy(true, autoStash ? `正在暂存并${mode === 'rebase' ? '变基' : '拉取'} ${pane.branch}…` : (mode === 'rebase' ? `正在变基 ${pane.branch}…` : `正在拉取 ${pane.branch}…`));
+
+  const res = await api.pull(state.dir, pane.branch, mode, autoStash);
   logResult(res);
+  reportStash(res);
 
   if (!res.ok && res.conflict) {
     setBusy(false);
     toast('拉取时发生冲突，请解决后继续', 'warn');
+    state.merge.pendingStash = !!res.stashed;
     await openMergeView(res.files || [], pane.branch, res.operation || 'rebase');
     refreshInfoOnly();
     return;
@@ -861,7 +915,7 @@ async function doPull(side) {
  * 推送某个分支
  * skipConfirm=true 时不再弹确认框（用于「摘取并推送」的连续动作）
  */
-async function performPush(side, { skipConfirm = false, retried = false } = {}) {
+async function performPush(side, { skipConfirm = false, retried = false, autoRebase = false } = {}) {
   const pane = state.panes[side];
   if (!pane || !pane.branch) return;
   if (pane.isRemote) {
@@ -889,12 +943,16 @@ async function performPush(side, { skipConfirm = false, retried = false } = {}) 
   if (!res.ok) {
     const rejected = /non-fast-forward|rejected|fetch first|failed to push|\[rejected\]/i.test(res.error || '');
     if (rejected && !retried) {
-      const doRebase = await modalConfirm(
-        '远端有新提交',
-        '推送被拒绝：远端存在你本地没有的提交。<br />是否先变基到最新，然后自动重新推送？',
-        '变基并推送'
-      );
+      // 「摘取并推送」是明确的连续动作：被拒时直接变基重推，不再打断用户
+      const doRebase = autoRebase
+        ? true
+        : await modalConfirm(
+          '远端有新提交',
+          '推送被拒绝：远端存在你本地没有的提交。<br />是否先变基到最新，然后自动重新推送？',
+          '变基并推送'
+        );
       if (doRebase) {
+        if (autoRebase) toast('远端有新提交，正在变基后自动重推…', 'warn');
         await doPull(side);
         // 变基若产生冲突，等解决完再推
         if (state.info && state.info.operation) {
@@ -951,7 +1009,9 @@ async function doCherryPick(mode = 'pick') {
     commits.slice().reverse().map((c) => `${c.short} ${escapeHtml(c.subject)}`).join('<br />') +
     `</div>`;
   if (dirty) {
-    body += `<div style="color:#a11f1f;margin-top:6px">注意：当前工作区有 ${dirty} 处未提交改动，摘取前需要先提交或储藏。</div>`;
+    body += `<div style="color:#8a5606;margin-top:6px">当前工作区有 ${dirty} 处未提交改动：<br />` +
+      `摘取前会自动执行 <b>git stash push -u</b> 暂存（含未跟踪文件），摘取完成后自动恢复。<br />` +
+      `如果中途出现冲突，改动会一直保留在 stash 里，等你解决冲突并继续（或中止）之后再恢复。</div>`;
   }
   if (picked.length) {
     body += `<div style="color:#8a5606;margin-top:6px">其中 ${picked.length} 个提交在 ${escapeHtml(dst.branch)} 上已存在等价提交，可能会重复或冲突。</div>`;
@@ -964,9 +1024,15 @@ async function doCherryPick(mode = 'pick') {
   const ok = await modalConfirm(withPush ? '摘取并推送' : '摘取提交', body, withPush ? '摘取并推送' : '开始摘取');
   if (!ok) return;
 
-  setBusy(true, '正在摘取提交…');
-  const res = await api.cherryPick({ dir: state.dir, target: dst.branch, commits: commits.map((c) => c.hash) });
+  setBusy(true, dirty ? '正在暂存改动并摘取…' : '正在摘取提交…');
+  const res = await api.cherryPick({
+    dir: state.dir,
+    target: dst.branch,
+    commits: commits.map((c) => c.hash),
+    autoStash: !!dirty
+  });
   logResult(res);
+  reportStash(res);
 
   if (res.ok) {
     src.clearSelection();
@@ -976,7 +1042,7 @@ async function doCherryPick(mode = 'pick') {
       if (res.empty) {
         toast('没有产生新提交，跳过推送', 'warn');
       } else {
-        await performPush(dst.side, { skipConfirm: true });
+        await performPush(dst.side, { skipConfirm: true, autoRebase: true });
       }
     } else {
       setBusy(false);
@@ -1002,6 +1068,8 @@ async function doCherryPick(mode = 'pick') {
     toast(withPush ? '摘取时发生冲突，解决后会继续推送' : '摘取时发生冲突，请在冲突窗口中解决', 'warn');
     state.merge.pendingPush = withPush;
     state.merge.pushSide = dst.side;
+    state.merge.pendingStash = !!res.stashed;
+    if (res.stashed) toast('工作区改动已暂存，解决冲突并继续后会自动恢复', 'ok');
     await openMergeView(res.files || [], dst.branch, 'cherry-pick');
     // 后台刷新一下顶部状态（此时仓库已切到目标分支）
     refreshInfoOnly();
@@ -1010,6 +1078,149 @@ async function doCherryPick(mode = 'pick') {
 
   toast(res.error || '摘取失败', 'err');
   await refreshAll();
+}
+
+/* -------------------------- 工作区改动 / 自动暂存 -------------------------- */
+
+const workState = { files: [], active: '', opening: false };
+
+async function openWorkView() {
+  if (workState.opening) return;
+  if (!state.dir) {
+    toast('请先选择一个仓库', 'warn');
+    return;
+  }
+  workState.opening = true;
+  const chip = $('#dirtyChip');
+  const chipText = chip ? chip.textContent : '';
+  if (chip) chip.textContent = '读取中…';
+  try {
+    const res = await api.workingChanges(state.dir);
+    if (!res || !res.ok) {
+      toast((res && res.error) || '读取工作区失败', 'err');
+      return;
+    }
+    workState.files = res.files || [];
+    workState.active = '';
+    const summary = res.stat ? res.stat.split('\n').pop().trim() : '';
+    $('#workCount').textContent = workState.files.length
+      ? workState.files.length + ' 个文件' + (summary ? ' · ' + summary : '')
+      : '';
+    setWorkDiff(workState.files.length ? '从左侧选择一个文件查看改动' : '工作区没有改动');
+    $('#workView').classList.remove('hidden');
+    $('#workRestore').classList.toggle('hidden', !state.stashDeferred);
+    renderWorkList();
+    if (workState.files.length) loadWorkDiff(workState.files[0].path);
+  } catch (e) {
+    toast('打开工作区失败：' + ((e && e.message) || e), 'err');
+  } finally {
+    workState.opening = false;
+    if (chip && chip.isConnected) chip.textContent = chipText;
+  }
+}
+
+function workCodeClass(code) {
+  if (code === '??') return 'unt';
+  if (code.includes('D')) return 'del';
+  if (code.includes('A')) return 'add';
+  return 'mod';
+}
+
+function renderWorkList() {
+  const list = $('#workList');
+  list.innerHTML = workState.files.map((f) =>
+    `<div class="work-item${workState.active === f.path ? ' active' : ''}" data-path="${escapeHtml(f.path)}">` +
+    `<span class="wcode ${workCodeClass(f.code)}">${escapeHtml(f.code.trim() || '?')}</span>` +
+    `<span class="wname">${escapeHtml(f.path)}</span></div>`).join('');
+  list.querySelectorAll('.work-item').forEach((el) => {
+    el.addEventListener('click', () => loadWorkDiff(el.dataset.path));
+  });
+}
+
+/** 把 git diff 文本按行着色：新增/删除/块头/文件头，让改动处一眼可见 */
+function workDiffHtml(text) {
+  const rows = String(text).split('\n').map((line) => {
+    let cls = '';
+    if (/^(\+\+\+|---)\s/.test(line)) cls = 'meta';
+    else if (line.startsWith('@@')) cls = 'hunk';
+    else if (/^(diff --git|index |new file mode|deleted file mode|similarity index|rename (from|to) |old mode|new mode|Binary files)/.test(line)) cls = 'head';
+    else if (line.startsWith('\\')) cls = 'meta';
+    else if (line.startsWith('+')) cls = 'add';
+    else if (line.startsWith('-')) cls = 'del';
+    return '<span class="dl' + (cls ? ' ' + cls : '') + '">' + (escapeHtml(line) || '&#8203;') + '</span>';
+  });
+  return rows.join('\n');
+}
+
+/** 统一的 diff 输出入口；colorize 为 false 时按纯文本显示（提示语 / 错误） */
+function setWorkDiff(text, { colorize = false } = {}) {
+  const el = $('#workDiff');
+  if (!colorize) {
+    el.textContent = text;
+    return;
+  }
+  el.innerHTML = workDiffHtml(text);
+}
+
+async function loadWorkDiff(relPath) {
+  const f = workState.files.find((x) => x.path === relPath);
+  if (!f) return;
+  workState.active = relPath;
+  renderWorkList();
+  setWorkDiff('读取中…');
+  const stagedOnly = !f.untracked && f.code[1] === ' ' && f.code[0] !== ' ';
+  const res = await api.workingDiff({
+    dir: state.dir,
+    relPath: f.path,
+    untracked: f.untracked,
+    staged: stagedOnly
+  });
+  if (workState.active !== relPath) return;
+  const ok = !!(res && res.ok);
+  setWorkDiff(ok ? (res.text || '（无差异）') : ((res && res.error) || '读取失败'), { colorize: ok });
+}
+
+/** 自动暂存的结果提示（摘取冲突未解决时暂存先留着） */
+function reportStash(res) {
+  if (!res || !res.stashed) return;
+  if (res.conflict) return;
+  if (res.stashRestored) {
+    toast('工作区改动已自动恢复', 'ok');
+    return;
+  }
+  if (res.stashConflict && (res.stashFiles || []).length) {
+    openStashConflict(res.stashFiles, res.stashError);
+    return;
+  }
+  if (res.stashError) toast(res.stashError, 'warn');
+}
+
+/** 打开内置冲突界面，解决「恢复暂存改动」时的冲突 */
+function openStashConflict(files, note) {
+  state.stashDeferred = true;
+  const branch = (state.info && state.info.branch) || '';
+  openMergeView(files || [], branch, 'stash');
+  toast(note || '恢复暂存改动时发生冲突，请解决后点「全部完成，恢复改动」', 'warn');
+}
+
+/** 恢复暂存的改动：有冲突时进入冲突界面逐个解决 */
+async function restoreStash() {
+  setBusy(true, '正在恢复暂存的改动…');
+  const res = await api.stashPop(state.dir);
+  setBusy(false);
+  if (res && res.ok) {
+    state.stashDeferred = false;
+    $('#workRestore').classList.add('hidden');
+    toast('工作区改动已恢复', 'ok');
+    await refreshAll();
+    return;
+  }
+  if (res && res.conflict && (res.files || []).length) {
+    $('#workView').classList.add('hidden');
+    openStashConflict(res.files, res.error);
+    return;
+  }
+  toast((res && res.error) || '改动未能恢复，仍在 stash 里', 'err');
 }
 
 /* -------------------------- 提交详情 -------------------------- */
@@ -1254,11 +1465,15 @@ async function openMergeView(files, targetBranch, operation) {
   $('#mergeView').classList.remove('hidden');
 
   const isRebase = state.merge.operation === 'rebase';
-  $('#mergeTitle').textContent = isRebase ? '解决变基冲突' : '解决摘取冲突';
+  const isStash = state.merge.operation === 'stash';
+  $('#mergeTitle').textContent = state.merge.fixQueue && state.merge.fixBranch
+    ? '解决冲突 · ' + state.merge.fixBranch
+    : (isStash ? '解决改动恢复冲突' : (isRebase ? '解决变基冲突' : '解决摘取冲突'));
   $('#oursName').textContent = isRebase ? `远端最新（${state.merge.target}）` : `当前分支（${state.merge.target}）`;
-  $('#theirsName').textContent = isRebase ? '你的本地提交' : '被摘取的提交';
-  $('#mfContinue').textContent = isRebase ? '全部完成，继续变基' : '全部完成，继续摘取';
-  $('#mfAbort').textContent = isRebase ? '中止变基' : '中止摘取';
+  $('#theirsName').textContent = isStash ? '你暂存的改动' : (isRebase ? '你的本地提交' : '被摘取的提交');
+  $('#mfContinue').textContent = isStash ? '全部完成，恢复改动' : (isRebase ? '全部完成，继续变基' : '全部完成，继续摘取');
+  $('#mfAbort').textContent = isStash ? '放弃恢复（保留 stash）' : (isRebase ? '中止变基' : '中止摘取');
+  $('#mfSkip').classList.toggle('hidden', isStash);
   $('#mfList').innerHTML = '';
   const st = await api.conflicts(state.dir);
   if (st && st.ok) {
@@ -1428,6 +1643,23 @@ async function continuePick() {
     renderMergeFileList();
     return;
   }
+  // 恢复暂存改动导致的冲突：解决完 add 之后丢掉这条 stash 记录即可
+  if (state.merge.operation === 'stash') {
+    setBusy(true, '正在完成改动恢复…');
+    const fin = await api.stashFinish(state.dir);
+    setBusy(false);
+    if (!fin || !fin.ok) {
+      toast((fin && fin.error) || '完成恢复失败', 'err');
+      return;
+    }
+    state.stashDeferred = false;
+    $('#workRestore').classList.add('hidden');
+    closeMergeView();
+    await refreshAll();
+    toast('工作区改动已恢复', 'ok');
+    return;
+  }
+
   const isRebase = state.merge.operation === 'rebase';
   setBusy(true, isRebase ? '正在继续变基…' : '正在继续摘取…');
   const res = await api.continueCherryPick(state.dir);
@@ -1435,10 +1667,27 @@ async function continuePick() {
   if (res.ok) {
     const needPush = state.merge.pendingPush;
     const pushSide = state.merge.pushSide;
+    const needStash = state.merge.pendingStash;
     closeMergeView();
     toast(isRebase ? '变基已完成' : '摘取已完成', 'ok');
+    if (needStash) await restoreStash();
     await refreshAll();
-    if (needPush && pushSide) await performPush(pushSide, { skipConfirm: true });
+
+    // 批量页：单个分支的冲突解决完了，记结果 → 推送 → 继续下一个分支
+    if (state.merge.fixQueue) {
+      const br = state.merge.fixBranch;
+      const item = state.merge.fixItem;
+      state.merge.fixQueue = false;
+      state.merge.fixBranch = '';
+      state.merge.fixItem = null;
+      fixState.results.push({ branch: br, state: 'picked', count: item ? item.commits.length : 0, message: '（解决冲突后继续）' });
+      renderFixResult();
+      if (fixState.mode === 'pickPush' && br) await fixPush(br);
+      await fixStep();
+      return;
+    }
+
+    if (needPush && pushSide) await performPush(pushSide, { skipConfirm: true, autoRebase: true });
     return;
   }
   setBusy(false);
@@ -1467,11 +1716,31 @@ function closeMergeView() {
   state.merge.current = null;
   state.merge.files = [];
   state.merge.pendingPush = false;
+  state.merge.pendingStash = false;
   state.merge.pushSide = '';
   $('#mergeView').classList.add('hidden');
 }
 
 async function abortPick() {
+  // 放弃恢复暂存改动：工作区回干净，改动仍留在 stash
+  if (state.merge.operation === 'stash') {
+    const okStash = await modalConfirm(
+      '放弃恢复改动',
+      '将把工作区恢复到干净状态，你暂存的改动会<b>保留在 stash 里</b>，之后还能再恢复。确定放弃吗？',
+      '放弃恢复',
+      true
+    );
+    if (!okStash) return;
+    setBusy(true, '正在回滚…');
+    const res = await api.stashAbort(state.dir);
+    setBusy(false);
+    if (!res || !res.ok) { toast((res && res.error) || '回滚失败', 'err'); return; }
+    closeMergeView();
+    await refreshAll();
+    toast('已放弃恢复，改动仍在 stash 里', 'warn');
+    return;
+  }
+
   const label = state.merge.operation === 'rebase' ? '变基' : '摘取';
   const ok = await modalConfirm(
     '中止' + label,
@@ -1484,9 +1753,22 @@ async function abortPick() {
   const res = await api.abortCherryPick(state.dir);
   setBusy(false);
   if (!res.ok) { toast(res.error || '中止失败', 'err'); return; }
+  const needStash = state.merge.pendingStash;
   closeMergeView();
+  if (needStash) await restoreStash();
   await refreshAll();
   toast('已中止' + label, 'ok');
+
+  if (state.merge.fixQueue) {
+    const br = state.merge.fixBranch;
+    state.merge.fixQueue = false;
+    state.merge.fixBranch = '';
+    state.merge.fixItem = null;
+    fixState.queue = [];
+    fixState.results.push({ branch: br || '', state: 'aborted', count: 0, message: '已中止，剩余分支未执行' });
+    renderFixResult();
+    await finishFix();
+  }
 }
 
 async function skipPick(silent) {
@@ -1579,9 +1861,20 @@ function currentTab() {
 function switchTab(name) {
   state.tab = name;
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  // 左栏是同一个 DOM 节点，按页签搬到对应容器里，选择状态/筛选条件都保持
+  if (name === 'fix') {
+    const host = $('#fixPaneHost');
+    if (host && state.panes.left && state.panes.left.el.parentElement !== host) host.appendChild(state.panes.left.el);
+  } else {
+    restoreLeftPane();
+  }
   $('#viewMerge').classList.toggle('hidden', name !== 'merge');
   $('#viewCheck').classList.toggle('hidden', name !== 'check');
+  $('#viewFix').classList.toggle('hidden', name !== 'fix');
   if (name === 'check') initCheckView();
+  if (name === 'fix') initFixView();
+  if (name === 'fix' || name === 'merge') refreshFlags();
+  updateFixButtons();
 }
 
 function timeLabelOf(v) {
@@ -1727,14 +2020,18 @@ function renderCheckSummary(res, timeVal) {
   const timeTxt = timeVal === 'custom'
     ? `${$('#ckFrom').value || '不限'} ~ ${$('#ckTo').value || '不限'}`
     : timeLabelOf(timeVal);
-  const bad = res.unmergedCount;
-  const okPart = bad === 0
-    ? `<span class="num-ok">全部已合并</span>`
-    : `<span class="num-bad">${bad} 个未合并</span>`;
+  // 未合并 = 一定没合并的；需确认 = merge-tree 冲突、无法自动判定的（不算进未合并，避免重复计数）
+  const maybe = res.maybeCount || 0;
+  const bad = Math.max(0, res.unmergedCount - maybe);
+  const parts = [];
+  if (bad > 0) parts.push(`<span class="num-bad">${bad} 个未合并</span>`);
+  if (maybe > 0) parts.push(`<span class="num-warn">${maybe} 个需人工确认</span>`);
+  const okPart = parts.length ? parts.join('、') : `<span class="num-ok">全部已合并</span>`;
   $('#ckSummary').innerHTML =
     `<b>${who}</b> · ${escapeHtml(timeTxt)} · <span class="ck-sub">` +
     `源 <b>${escapeHtml(res.source)}</b> → 目标 <b>${escapeHtml(res.target)}</b></span><br />` +
-    `共 <b>${res.total}</b> 个提交，${okPart}（已合并 ${res.mergedCount} 个）` +
+    `共 <b>${res.total}</b> 个提交，${okPart}（已合并 ${res.mergedCount} 个` +
+    (res.squashCount ? `，其中 <b>${res.squashCount}</b> 个为 squash 合并` : '') + '）' +
     (res.total === 0 ? '<br /><span class="ck-sub">该时间范围内没有这个人的提交，换个时间范围或检测人试试</span>' : '');
 }
 
@@ -1759,13 +2056,310 @@ function renderCheckList() {
       <span class="col-author" title="${escapeHtml(c.email)}">${escapeHtml(c.author)}</span>
       <span class="col-date" title="${escapeHtml(c.date)}">${fmtDateShort(c.timestamp)}</span>
       <span class="col-state">
-        <span class="badge ${c.merged ? 'merged' : 'unmerged'}">${c.merged ? '已合并' : '未合并'}</span>
+        <span class="badge ${c.merged ? (c.mergeKind === 'patch' ? 'merged' : 'merged squash') : (c.maybe ? 'maybe' : 'unmerged')}" title="${
+          c.merged ? (c.mergeKind === 'patch' ? '目标分支存在等价补丁（patch-id）' : (c.mergeKind === 'deep' ? '三方合并无残留，改动已在目标分支（merge-tree 判定）' : '目标分支文件内容已一致（squash 判定）'))
+          : (c.maybe ? '目标分支上同一处被后续改过，无法自动判定，建议人工看一眼' : '目标分支没有这段改动')
+        }">${c.merged ? (c.mergeKind === 'patch' ? '已合并' : '已合并·squash') : (c.maybe ? '可能已合并' : '未合并')}</span>
       </span>
     </div>`).join('');
 
   list.querySelectorAll('.ck-row').forEach((el) => {
     el.addEventListener('dblclick', () => openDetail(el.dataset.hash));
   });
+}
+
+/* -------------------------- 代码修复快速合并 -------------------------- */
+
+const fixState = {
+  dir: '',
+  branches: [],
+  selected: new Set(),
+  filter: '',
+  running: false,
+  mode: 'pick',
+  queue: [],
+  results: [],
+  current: ''
+};
+
+const leftHome = { parent: null, next: null };
+
+/** 记住左栏 DOM 原来在 快速合并 页里的位置，切回来时放回原处 */
+function rememberLeftHome() {
+  const el = state.panes.left && state.panes.left.el;
+  if (!el || !el.parentElement || el.parentElement.id === 'fixPaneHost') return;
+  leftHome.parent = el.parentElement;
+  leftHome.next = el.nextElementSibling;
+}
+
+function restoreLeftPane() {
+  const el = state.panes.left && state.panes.left.el;
+  if (!el || !leftHome.parent) return;
+  if (el.parentElement !== leftHome.parent) leftHome.parent.insertBefore(el, leftHome.next);
+}
+
+async function initFixView() {
+  if (!state.dir) {
+    fixState.branches = [];
+    renderFixList();
+    updateFixButtons();
+    return;
+  }
+  if (fixState.dir !== state.dir) {
+    fixState.dir = state.dir;
+    fixState.selected = new Set();
+    fixState.results = [];
+    renderFixResult();
+  }
+  const res = await api.branches(state.dir);
+  if (!res || !res.ok) {
+    toast((res && res.error) || '读取分支失败', 'err');
+    return;
+  }
+  fixState.branches = (res.locals || res.local || res.branches || [])
+    .filter((b) => !b.isRemote)
+    .sort((a, b) => String(a.name).localeCompare(String(b.name), 'zh'));
+  const names = new Set(fixState.branches.map((b) => b.name));
+  const srcName = (state.panes.left && state.panes.left.branch) || '';
+  if (srcName) fixState.selected.delete(srcName);
+  for (const n of [...fixState.selected]) if (!names.has(n)) fixState.selected.delete(n);
+  renderFixList();
+  updateFixButtons();
+}
+
+function renderFixList() {
+  const list = $('#fixBranchList');
+  if (!list) return;
+  if (!state.dir) { list.innerHTML = '<div class="fix-empty">请先在顶部选择仓库</div>'; return; }
+  if (!fixState.branches.length) { list.innerHTML = '<div class="fix-empty">没有本地分支</div>'; return; }
+  const kw = fixState.filter.trim().toLowerCase();
+  const rows = fixState.branches.filter((b) => !kw || String(b.name).toLowerCase().includes(kw));
+  if (!rows.length) { list.innerHTML = '<div class="fix-empty">没有匹配的分支</div>'; return; }
+
+  const srcName = (state.panes.left && state.panes.left.branch) || '';
+  list.innerHTML = rows.map((b) => {
+    const isSrc = !!srcName && b.name === srcName;
+    const on = !isSrc && fixState.selected.has(b.name);
+    return '<div class="fix-row' + (on ? ' checked' : '') + (isSrc ? ' disabled' : '') + '" data-branch="' + escapeHtml(b.name) + '" data-src="' + (isSrc ? '1' : '0') + '">' +
+      (isSrc ? '<input type="checkbox" disabled tabindex="-1" />' : '<input type="checkbox" ' + (on ? 'checked' : '') + ' tabindex="-1" />') +
+      '<span class="fix-name" title="' + escapeHtml(b.name) + '">' + escapeHtml(b.name) + '</span>' +
+      (isSrc ? '<span class="badge">源分支</span>' : (b.current ? '<span class="badge head">当前</span>' : '')) +
+      (b.upstream ? '<span class="fix-up">' + escapeHtml(b.upstream) + '</span>' : '') +
+      '</div>';
+  }).join('');
+
+  list.querySelectorAll('.fix-row').forEach((row) => {
+    row.addEventListener('click', () => {
+      if (row.dataset.src === '1') { toast('这里是源分支，不能再摘取回自身', 'warn'); return; }
+      const name = row.dataset.branch;
+      if (fixState.selected.has(name)) fixState.selected.delete(name);
+      else fixState.selected.add(name);
+      renderFixList();
+      updateFixButtons();
+    });
+  });
+}
+
+function updateFixButtons() {
+  const btn = $('#btnFixPick');
+  const btnPush = $('#btnFixPickPush');
+  if (!btn || !btnPush) return;
+  const n = state.panes.left ? state.panes.left.selected.size : 0;
+  const m = fixState.selected.size;
+  const disabled = !n || !m || state.busy || fixState.running;
+  btn.disabled = disabled;
+  btnPush.disabled = disabled;
+  $('.xfer-count', btn).textContent = String(n || 0);
+  $('.xfer-count', btnPush).textContent = String(n || 0);
+  const sel = $('#fixSelCount');
+  if (sel) sel.textContent = m ? '已选 ' + m + ' 个分支' : '未选择分支';
+  const tip = $('#fixTip');
+  if (tip) {
+    if (!n) tip.textContent = '先在左侧勾选要摘取的提交';
+    else if (!m) tip.textContent = '再在右侧勾选目标分支';
+    else tip.textContent = '将把 ' + n + ' 个提交摘取到 ' + m + ' 个分支';
+  }
+  btn.title = disabled ? '先勾选左侧提交和右侧分支' : '把 ' + n + ' 个提交摘取到 ' + m + ' 个分支';
+  btnPush.title = btn.title + '，每个分支成功后立即推送';
+}
+
+function fixResultLabel(r) {
+  const map = {
+    picked: '已摘取', pushed: '已摘取并推送', empty: '无需摘取（改动已存在）',
+    skipped: '已合并，跳过', error: '失败', aborted: '已中止',
+    pushFail: '推送失败'
+  };
+  return map[r.state] || r.state;
+}
+
+function renderFixResult() {
+  const box = $('#fixResult');
+  if (!box) return;
+  if (!fixState.results.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="fix-result-title">执行结果</div>' + fixState.results.map((r) => {
+    const cls = (r.state === 'picked' || r.state === 'pushed' || r.state === 'skipped' || r.state === 'empty')
+      ? 'ok' : (r.state === 'aborted' ? 'warn' : 'bad');
+    const msg = r.message ? String(r.message).split(/\r?\n/)[0].slice(0, 70) : '';
+    return '<div class="fix-result-row ' + cls + '">' +
+      '<span class="fix-res-branch" title="' + escapeHtml(r.branch) + '">' + escapeHtml(r.branch) + '</span>' +
+      '<span class="fix-res-state">' + escapeHtml(fixResultLabel(r)) + (r.count ? ' · ' + r.count + ' 条' : '') + '</span>' +
+      (msg ? '<span class="fix-res-msg" title="' + escapeHtml(msg) + '">' + escapeHtml(msg) + '</span>' : '') +
+      '</div>';
+  }).join('');
+}
+
+async function startFixMerge(mode) {
+  const src = state.panes.left;
+  if (!src || !state.dir) { toast('请先选择仓库', 'warn'); return; }
+  const commits = src.selectedCommits || [];
+  if (!commits.length) { toast('请先在左侧勾选要摘取的提交', 'warn'); return; }
+  const srcName = src.branch || '';
+  const targets = fixState.branches.filter((b) => fixState.selected.has(b.name) && b.name !== srcName).map((b) => b.name);
+  if (!targets.length) { toast('请先在右侧勾选至少一个分支', 'warn'); return; }
+
+  const shas = commits.map((c) => c.hash);
+  const bounds = src.timeBounds ? src.timeBounds() : {};
+
+  setBusy(true, '正在检查各分支是否已包含这些提交…');
+  const plan = [];
+  for (const branch of targets) {
+    const r = await api.patchFlags({
+      dir: state.dir, source: src.branch, target: branch,
+      since: bounds.since || '', until: bounds.until || '', only: shas
+    });
+    const merged = (r && r.ok) ? (r.map || {}) : {};
+    plan.push({
+      branch,
+      commits: commits.filter((c) => !merged[c.hash]),
+      skipped: commits.filter((c) => merged[c.hash]).length
+    });
+  }
+  setBusy(false);
+
+  const usable = plan.filter((p) => p.commits.length);
+  if (!usable.length) {
+    toast('所选提交在勾选的分支上都已经合并过了，无需摘取', 'warn');
+    return;
+  }
+
+  const withPush = mode === 'pickPush';
+  let body = '从 <b>' + escapeHtml(src.branch) + '</b> 摘取 <b>' + commits.length + '</b> 个提交，目标分支：' +
+    '<div class="hint" style="margin:6px 0;max-height:170px;overflow:auto;font-family:Consolas,monospace">' +
+    plan.map((p) => p.commits.length
+      ? escapeHtml(p.branch) + ' ← ' + p.commits.map((c) => c.short).join(' ')
+      : escapeHtml(p.branch) + ' ← <span style="color:#8a5606">已合并，跳过</span>').join('<br />') + '</div>';
+  const skippedTotal = plan.reduce((s, p) => s + p.skipped, 0);
+  if (skippedTotal) {
+    body += '<div style="color:#8a5606;margin-top:6px">有 ' + skippedTotal + ' 条提交在部分分支上已合并，已自动排除。</div>';
+  }
+  body += '<div class="hint" style="margin-top:6px">按列表顺序逐个分支执行（自动切换分支）；遇到冲突会停下来让你解决，解决后自动继续下一个分支。</div>';
+  if (withPush) body += '<div style="color:#0a5cb8;margin-top:6px">每个分支摘取成功后立即推送。</div>';
+
+  const ok = await modalConfirm(withPush ? '批量摘取并推送' : '批量摘取', body, withPush ? '开始摘取并推送' : '开始摘取');
+  if (!ok) return;
+
+  fixState.mode = withPush ? 'pickPush' : 'pick';
+  fixState.queue = usable;
+  fixState.results = plan.filter((p) => !p.commits.length).map((p) => ({ branch: p.branch, state: 'skipped', count: 0 }));
+  fixState.running = true;
+  renderFixResult();
+  updateFixButtons();
+  await fixStep();
+}
+
+async function fixStep() {
+  const item = fixState.queue.shift();
+  if (!item) {
+    fixState.running = false;
+    await finishFix();
+    return;
+  }
+  fixState.current = item.branch;
+  const dirty = (state.info && state.info.dirty ? state.info.dirty.length : 0);
+  setBusy(true, '正在把 ' + item.commits.length + ' 个提交摘取到 ' + item.branch + '…（剩 ' + fixState.queue.length + ' 个分支）');
+
+  const res = await api.cherryPick({
+    dir: state.dir,
+    target: item.branch,
+    commits: item.commits.map((c) => c.hash),
+    autoStash: !!dirty
+  });
+  logResult(res);
+
+  if (res.ok) {
+    fixState.results.push({
+      branch: item.branch,
+      state: res.empty ? 'empty' : 'picked',
+      count: res.empty ? 0 : item.commits.length,
+      message: res.message || ''
+    });
+    setBusy(false);
+    await refreshAll();
+    if (fixState.mode === 'pickPush' && !res.empty) await fixPush(item.branch);
+    renderFixResult();
+    return fixStep();
+  }
+
+  if (res.conflict) {
+    setBusy(false);
+    state.merge.pendingPush = false;
+    state.merge.pushSide = '';
+    state.merge.pendingStash = !!res.stashed;
+    state.merge.fixQueue = true;
+    state.merge.fixBranch = item.branch;
+    state.merge.fixItem = item;
+    toast('摘取到 ' + item.branch + ' 时发生冲突，解决后会继续剩下的分支', 'warn');
+    await openMergeView(res.files || [], item.branch, 'cherry-pick');
+    return;
+  }
+
+  fixState.results.push({ branch: item.branch, state: 'error', count: 0, message: res.error || res.message || '摘取失败' });
+  setBusy(false);
+  renderFixResult();
+  await refreshAll();
+  return fixStep();
+}
+
+/** 批量模式下的推送：被拒就先变基重推一次 */
+async function fixPush(branch) {
+  setBusy(true, '正在推送 ' + branch + '…');
+  let res = await api.push(state.dir, branch);
+  if (!res.ok && /non-fast-forward|rejected|fetch first|\[rejected\]/i.test(res.error || '')) {
+    toast(branch + ' 推送被拒，正在变基后重试…', 'warn');
+    const pr = await api.pull(state.dir, branch, 'rebase', false);
+    if (pr && pr.ok && !pr.conflict) {
+      res = await api.push(state.dir, branch);
+    } else {
+      res = { ok: false, error: '推送被拒，变基未完成（可能需要手动处理冲突）' };
+    }
+  }
+  setBusy(false);
+
+  const last = fixState.results[fixState.results.length - 1];
+  if (res.ok) {
+    if (last && last.branch === branch) last.state = 'pushed';
+  } else {
+    fixState.results.push({ branch, state: 'pushFail', count: 0, message: res.error || '推送失败' });
+  }
+  renderFixResult();
+}
+
+async function finishFix() {
+  fixState.running = false;
+  fixState.current = '';
+  updateFixButtons();
+  await refreshAll();
+  const okN = fixState.results.filter((r) => r.state === 'picked' || r.state === 'pushed').length;
+  const skipN = fixState.results.filter((r) => r.state === 'skipped').length;
+  const badN = fixState.results.filter((r) => r.state === 'error' || r.state === 'pushFail' || r.state === 'aborted').length;
+  const parts = ['成功 ' + okN + ' 个分支'];
+  if (skipN) parts.push('跳过 ' + skipN + ' 个（已合并）');
+  if (badN) parts.push('失败 ' + badN + ' 个');
+  toast('批量摘取完成：' + parts.join('，'), badN ? 'warn' : 'ok');
+  renderFixResult();
+  if (state.panes.left) state.panes.left.clearSelection();
+  refreshFlags();
 }
 
 /* -------------------------- 全局事件 -------------------------- */
@@ -1816,6 +2410,22 @@ function bindGlobal() {
   $$('.push-btn').forEach((b) => b.addEventListener('click', () => doPush(b.dataset.side)));
   $('#btnTransfer').addEventListener('click', () => doCherryPick('pick'));
   $('#btnTransferPush').addEventListener('click', () => doCherryPick('pickPush'));
+
+  $('#btnFixPick').addEventListener('click', () => startFixMerge('pick'));
+  $('#btnFixPickPush').addEventListener('click', () => startFixMerge('pickPush'));
+  $('#btnFixAll').addEventListener('click', () => {
+    const srcName = (state.panes.left && state.panes.left.branch) || '';
+    fixState.branches.forEach((b) => { if (b.name !== srcName) fixState.selected.add(b.name); });
+    renderFixList(); updateFixButtons();
+  });
+  $('#btnFixNone').addEventListener('click', () => {
+    fixState.selected.clear();
+    renderFixList(); updateFixButtons();
+  });
+  $('#fixSearch').addEventListener('input', (e) => { fixState.filter = e.target.value; renderFixList(); });
+  $('#fixSearchClear').addEventListener('click', () => {
+    fixState.filter = ''; $('#fixSearch').value = ''; renderFixList();
+  });
   $('#btnClearSel').addEventListener('click', () => {
     state.panes.left.clearSelection();
     state.panes.right.clearSelection();
@@ -1839,6 +2449,10 @@ function bindGlobal() {
     detailOpenFor = '';
     $('#detailDrawer').classList.add('hidden');
   });
+
+  // 工作区改动弹窗
+  $('#workClose').addEventListener('click', () => $('#workView').classList.add('hidden'));
+  $('#workRestore').addEventListener('click', () => restoreStash());
 
   // 冲突窗口
   $('#mfPrev').addEventListener('click', () => {
@@ -1910,6 +2524,7 @@ function bindGlobal() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'F5') { e.preventDefault(); refreshAll({ reselect: true }); }
     if (e.key === 'Escape') {
+      if (!$('#workView').classList.contains('hidden')) { $('#workView').classList.add('hidden'); return; }
       if (!$('#settingsModal').classList.contains('hidden')) { $('#settingsModal').classList.add('hidden'); return; }
       if (!$('#modal').classList.contains('hidden')) { $('#modalCancel').click(); return; }
       if (!$('#detailDrawer').classList.contains('hidden')) {
@@ -1938,6 +2553,7 @@ async function boot() {
   state.config = (await api.getConfig()).config || {};
   state.panes.left = new Pane('left');
   state.panes.right = new Pane('right');
+  rememberLeftHome();
   state.panes.left.limit = state.config.pageSize || 200;
   state.panes.right.limit = state.config.pageSize || 200;
   bindGlobal();
@@ -1953,6 +2569,19 @@ async function boot() {
     state.panes.right.render();
   }
 }
+
+// 全局兜底：不吞异常，界面上一律有提示，同时写日志
+window.addEventListener('error', (e) => {
+  const msg = (e && e.message) || '脚本错误';
+  try { toast('界面出错：' + msg, 'err'); } catch (_) { /* ignore */ }
+  try { api.logError({ kind: 'error', message: msg, stack: (e && e.error && e.error.stack) || (e && e.filename + ':' + e.lineno) || '' }); } catch (_) { /* ignore */ }
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const r = e && e.reason;
+  const msg = (r && (r.message || r)) || '未处理的异常';
+  try { toast('操作失败：' + msg, 'err'); } catch (_) { /* ignore */ }
+  try { api.logError({ kind: 'rejection', message: String(msg), stack: (r && r.stack) || '' }); } catch (_) { /* ignore */ }
+});
 
 boot();
 

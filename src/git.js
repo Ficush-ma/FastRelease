@@ -10,7 +10,7 @@ const SEP = '\x1f';
  * 执行 git 命令（不经 shell，参数数组传递，避免转义问题）
  */
 function run(cwd, args, opts = {}) {
-  const { timeout = 60000, env = {} } = opts;
+  const { timeout = 60000, env = {}, input = null } = opts;
   const fullArgs = [
     '-c', 'core.quotepath=false',
     '-c', 'i18n.logOutputEncoding=UTF-8',
@@ -69,7 +69,10 @@ function run(cwd, args, opts = {}) {
         timedOut
       });
     });
-    try { child.stdin.end(); } catch (_) { /* ignore */ }
+    try {
+      if (input != null) child.stdin.end(input);
+      else child.stdin.end();
+    } catch (_) { /* ignore */ }
   });
 }
 
@@ -93,6 +96,121 @@ async function ensureRepo(dir) {
 async function getStatusShort(dir) {
   const r = await run(dir, ['status', '--porcelain=v1', '-uall'], { timeout: 30000 });
   return r.ok ? r.stdout : '';
+}
+
+/** 工作区改动明细（文件 + 状态码），供弹窗展示 */
+async function workingChanges(dir) {
+  const repo = await ensureRepo(dir);
+  if (!repo.ok) return repo;
+  const root = repo.root;
+  const [stR, statR] = await Promise.all([
+    run(root, ['status', '--porcelain=v1', '-uall'], { timeout: 30000 }),
+    run(root, ['diff', '--stat', 'HEAD'], { timeout: 30000 })
+  ]);
+  if (!stR.ok) return { ok: false, error: mergeOutput(stR) || '读取工作区状态失败' };
+
+  const files = [];
+  for (const line of stR.stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const code = line.slice(0, 2);
+    const p = line.slice(3).trim();
+    files.push({
+      code,
+      path: p,
+      untracked: code === '??',
+      staged: code[0] !== ' ' && code[0] !== '?'
+    });
+  }
+  return { ok: true, files, stat: (statR.ok ? statR.stdout : '').trim() };
+}
+
+/** 单个改动文件的 diff（未跟踪文件返回内容预览） */
+async function workingDiff(dir, { relPath, untracked = false, staged = false } = {}) {
+  const repo = await ensureRepo(dir);
+  if (!repo.ok) return repo;
+  if (!relPath) return { ok: false, error: '缺少文件路径' };
+  const root = repo.root;
+
+  if (untracked) {
+    try {
+      const txt = fs.readFileSync(path.join(root, relPath), 'utf8');
+      const lines = txt.replace(/\r\n/g, '\n').split('\n');
+      // 去掉文件末尾换行产生的空行，避免预览里多出一条空白「新增」行
+      if (lines.length && lines[lines.length - 1] === '') lines.pop();
+      const preview = lines.slice(0, 500).map((l) => '+ ' + l).join('\n');
+      return { ok: true, text: preview + (lines.length > 500 ? `\n…（共 ${lines.length} 行，仅显示前 500 行）` : ''), untracked: true };
+    } catch (e) {
+      return { ok: false, error: '读取文件失败：' + ((e && e.message) || e) };
+    }
+  }
+
+  const args = ['diff', '--no-color'];
+  if (staged) args.push('--cached');
+  args.push('--', relPath);
+  const r = await run(root, args, { timeout: 30000 });
+  if (!r.ok) return { ok: false, error: mergeOutput(r) || '读取 diff 失败' };
+  return { ok: true, text: r.stdout || '（无文本差异，可能是二进制文件或仅权限变化）' };
+}
+
+/** 自动暂存工作区（含未跟踪文件） */
+async function stashPush(dir, { message = '' } = {}) {
+  const repo = await ensureRepo(dir);
+  if (!repo.ok) return repo;
+  const msg = message || 'FastRelease 自动暂存 ' + new Date().toISOString();
+  const r = await run(repo.root, ['stash', 'push', '-u', '-m', msg], { timeout: 180000 });
+  const out = mergeOutput(r);
+  if (!r.ok) return { ok: false, stashed: false, error: '自动暂存失败：\n' + out };
+  if (/No local changes/i.test(out)) return { ok: true, stashed: false, message: out };
+  return { ok: true, stashed: true, message: out };
+}
+
+/** 恢复最近一次自动暂存的改动；有冲突时返回冲突文件，交给内置冲突界面解决 */
+async function stashPop(dir) {
+  const repo = await ensureRepo(dir);
+  if (!repo.ok) return repo;
+  const root = repo.root;
+  // 先带 --index 恢复：这样「已暂存 / 未暂存」的区分也能原样还原。
+  // 内容冲突时 git 会整体放弃 --index（不留半截标记），此时退回普通 pop，把冲突交给冲突界面。
+  let r = await run(root, ['stash', 'pop', '--index'], { timeout: 180000 });
+  let out = mergeOutput(r);
+  if (r.ok) return { ok: true, message: out, indexed: true };
+  if (/conflicts in index|without --index/i.test(out)) {
+    r = await run(root, ['stash', 'pop'], { timeout: 180000 });
+    out = mergeOutput(r);
+    if (r.ok) return { ok: true, message: out };
+  }
+
+  const st = await conflictState(root);
+  if (st.files.length) {
+    return {
+      ok: false,
+      conflict: true,
+      files: st.files,
+      error: '恢复改动时和目标分支的内容冲突，请逐个文件解决后点「全部完成，恢复改动」。'
+    };
+  }
+  return {
+    ok: false,
+    error: '改动未能自动恢复（仍保存在 stash 里，可用 git stash list 查看）：\n' + out
+  };
+}
+
+/** 冲突解决并 add 之后，丢掉这条 stash 记录（内容已在工作区） */
+async function stashFinish(dir) {
+  const repo = await ensureRepo(dir);
+  if (!repo.ok) return repo;
+  const r = await run(repo.root, ['stash', 'drop', 'stash@{0}'], { timeout: 60000 });
+  if (r.ok) return { ok: true };
+  return { ok: false, error: mergeOutput(r) || '删除 stash 记录失败' };
+}
+
+/** 放弃本次恢复：工作区回到干净状态，改动仍保留在 stash 里 */
+async function stashAbort(dir) {
+  const repo = await ensureRepo(dir);
+  if (!repo.ok) return repo;
+  const r = await run(repo.root, ['reset', '--hard', 'HEAD'], { timeout: 60000 });
+  if (r.ok) return { ok: true, message: '已放弃恢复，改动仍在 stash 里' };
+  return { ok: false, error: mergeOutput(r) || '回滚失败' };
 }
 
 async function isCherryPicking(dir) {
@@ -388,6 +506,9 @@ function runPipe(cwd, logArgs, opts = {}) {
       resolve({ ok: false, stdout: '', stderr: String((e && e.message) || e) });
       return;
     }
+    if (opts.input != null) {
+      try { a.stdin.write(opts.input); a.stdin.end(); } catch (_) { /* ignore */ }
+    }
     a.stdout.pipe(b.stdin);
     a.stderr.on('data', (d) => { err += d; });
     b.stdout.on('data', (d) => { out += d; });
@@ -427,6 +548,21 @@ async function buildPatchIndex(root, ref, { since, until, exclude } = {}) {
   return { ok: r.ok, shaToPatch, patchToShas, error: r.ok ? '' : (r.stderr || 'patch-id 计算失败') };
 }
 
+/** 只算指定提交的 patch-id（不建全量索引，批量预检查 / 徽标场景用） */
+async function patchIdsFor(root, shas) {
+  const map = new Map();
+  if (!shas || !shas.length) return { ok: true, map };
+  const r = await runPipe(root, [
+    'log', '--no-walk=unsorted', '--stdin', '--no-merges', '--pretty=format:commit %H', '-p'
+  ], { timeout: 180000, input: shas.join('\n') + '\n' });
+  if (!r.ok) return { ok: false, map, error: r.stderr || 'patch-id 计算失败' };
+  for (const line of r.stdout.split('\n')) {
+    const m = line.trim().match(/^([0-9a-f]{40})\s+([0-9a-f]{40})$/);
+    if (m) map.set(m[2], m[1]);
+  }
+  return { ok: true, map };
+}
+
 /** 取某个分支在时间窗口内的 patch-id 索引（带缓存 + 增量更新） */
 async function getPatchIndex(root, ref, { since, until }) {
   const tipR = await run(root, ['rev-parse', ref], { timeout: 20000 });
@@ -464,32 +600,242 @@ async function getPatchIndex(root, ref, { since, until }) {
  * 「已摘取」标记：源分支窗口内的提交，其 patch 是否已出现在目标分支窗口内。
  * 口径与界面筛选一致（同一 since/until，未指定时间时封顶 90 天）。
  */
-async function patchFlags(dir, { source, target, since, until }) {
+/**
+ * 统一的「已合并」判定：三层的唯一实现，徽标和合并检查都走这里。
+ *   ① patch-id（带缓存索引）—— 摘取/变基/rebase 后的常规场景
+ *   ② 内容比对（改动文件的 blob 是否一致）—— squash 后文件没再被改过
+ *   ③ merge-tree 三方合并干跑 —— squash 后文件在别处又被改过
+ *
+ * only：只判定这些提交（批量预检查 / 合并检查的提交列表）；不传则判定窗口内的全部提交。
+ * 返回四个集合：patch / content / deep（已合并的三种依据）、unsure（冲突，需人工确认）。
+ */
+/** 相对时间窗（现在往前推 N 天）每次调用都带毫秒，会把索引缓存打散；按整点归整 */
+function stableSince(since) {
+  const base = since || new Date(Date.now() - BADGE_MAX_DAYS * 864e5).toISOString();
+  const t = Date.parse(base);
+  if (!Number.isFinite(t)) return base;
+  return new Date(Math.floor(t / 3600000) * 3600000).toISOString();
+}
+
+async function mergedStatus(dir, { source, target, since, until, only = null, deepCap = 300, contentCap = 2000 } = {}) {
   const repo = await ensureRepo(dir);
   if (!repo.ok) return repo;
-  if (!source || !target || source === target) return { ok: true, map: {} };
-  const root = repo.root;
+  const nothing = { patch: new Set(), content: new Set(), deep: new Set(), unsure: new Set(), deepSkipped: 0 };
+  if (!source || !target || source === target) {
+    return { ok: true, ...nothing, counts: { source: 0, target: 0 } };
+  }
 
-  const from = since || new Date(Date.now() - BADGE_MAX_DAYS * 864e5).toISOString();
-  const [srcIdx, dstIdx] = await Promise.all([
-    getPatchIndex(root, source, { since: from, until: until || '' }),
+  const root = repo.root;
+  const from = stableSince(since);
+  const onlySet = Array.isArray(only) && only.length ? new Set(only) : null;
+
+  // 有明确提交列表时：只算这些提交的 patch-id + 目标分支的索引，省掉一遍全量索引（大仓库上差十几秒）
+  const [srcPatch, dstIdx] = await Promise.all([
+    onlySet ? patchIdsFor(root, [...onlySet]) : getPatchIndex(root, source, { since: from, until: until || '' }),
     getPatchIndex(root, target, { since: from, until: until || '' })
   ]);
-  if (!srcIdx.ok || !dstIdx.ok) {
-    return { ok: false, error: srcIdx.error || dstIdx.error || '索引计算失败' };
+  if (!srcPatch.ok || !dstIdx.ok) {
+    return { ok: false, error: srcPatch.error || dstIdx.error || '索引计算失败' };
+  }
+  const srcMap = onlySet ? srcPatch.map : srcPatch.shaToPatch;
+
+  const candidates = onlySet ? [...onlySet] : [...srcMap.keys()];
+
+  const patch = new Set();
+  for (const sha of candidates) {
+    const pid = srcMap.get(sha);
+    if (pid && dstIdx.patchToShas.has(pid)) patch.add(sha);
   }
 
-  const map = {};
-  for (const [sha, pid] of srcIdx.shaToPatch) {
-    if (dstIdx.patchToShas.has(pid)) map[sha] = true;
+  const content = new Set();
+  const rest = candidates.filter((sha) => !patch.has(sha));
+  if (rest.length) {
+    const cf = await contentFlags(root, { target, shas: rest, cap: contentCap });
+    if (cf.ok) for (const sha of rest) if (cf.map[sha]) content.add(sha);
   }
+
+  const deep = new Set();
+  const unsure = new Set();
+  const rest2 = rest.filter((sha) => !content.has(sha));
+  const deepSkipped = rest2.length > deepCap ? rest2.length - deepCap : 0;
+  if (rest2.length) {
+    const df = await deepFlags(root, { target, shas: rest2, cap: deepCap });
+    if (df.ok) {
+      for (const sha of rest2) {
+        if (df.map[sha]) deep.add(sha);
+        else if (df.unsure[sha]) unsure.add(sha);
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    patch, content, deep, unsure, deepSkipped,
+    window: { since: from, until: until || '' },
+    counts: { source: srcMap.size, target: dstIdx.patchToShas.size },
+    cached: !!(srcPatch.cached && dstIdx.cached)
+  };
+}
+
+/**
+ * 「已摘取」徽标：把 mergedStatus 的结果拍平成 { sha: true }。
+ * squash 里既包含内容比对的命中，也包含 merge-tree 的命中（前端只用于换配色和 tooltip）。
+ */
+async function patchFlags(dir, { source, target, since, until, only = null }) {
+  // 深层判定单条约 100~150ms，很便宜；按「当前要判定的条数」给预算，避免被固定上限截断
+  const onlyLen = Array.isArray(only) ? only.length : 0;
+  const deepCap = Math.max(200, Math.min(onlyLen || 300, 600));
+  const st = await mergedStatus(dir, { source, target, since, until, only, deepCap });
+  if (!st.ok) return st;
+
+  const map = {};
+  const squash = {};
+  for (const sha of st.patch) map[sha] = true;
+  for (const sha of st.content) { map[sha] = true; squash[sha] = true; }
+  for (const sha of st.deep) { map[sha] = true; squash[sha] = true; }
+
   return {
     ok: true,
     map,
-    window: { since: from, until: until || '' },
-    counts: { source: srcIdx.shaToPatch.size, target: dstIdx.shaToPatch.size },
-    cached: srcIdx.cached && dstIdx.cached
+    squash,
+    window: st.window,
+    counts: { ...st.counts, squash: Object.keys(squash).length, unsure: st.unsure.size, deepSkipped: st.deepSkipped, deepCap },
+    cached: st.cached
   };
+}
+
+/**
+ * 内容级判定：提交改过的文件，在目标分支上是否已经是同样的内容。
+ *
+ * 用途：squash（多条提交压成一条）后，原提交的 patch-id 在目标分支上不存在，
+ * patch-id 比对会误报「未合并」。这里不比 patch，比「改动是否已经落在目标文件里」：
+ * 一次 git log --raw 拿到每条提交产出的 blob，一次 git ls-tree -r 拿到目标分支的 blob，
+ * 逐个文件比对 oid。成本固定 2 个 git 进程，与提交数无关。
+ */
+async function contentFlags(root, { target, shas, cap = 2000 }) {
+  if (!target || !shas || !shas.length) return { ok: true, map: {} };
+  const list = shas.slice(0, cap);
+
+  const [rawR, treeR] = await Promise.all([
+    run(root, ['log', '--stdin', '--no-walk=unsorted', '--no-merges', '--raw', '--no-abbrev', '--pretty=format:commit %H'], {
+      timeout: 120000,
+      input: list.join('\n') + '\n'
+    }),
+    run(root, ['ls-tree', '-r', '-z', '--full-tree', target], { timeout: 60000 })
+  ]);
+  if (!rawR.ok) return { ok: false, error: mergeOutput(rawR) || '读取提交改动失败' };
+  if (!treeR.ok) return { ok: false, error: mergeOutput(treeR) || '读取目标分支文件列表失败' };
+
+  const targetBlob = new Map();
+  for (const rec of treeR.stdout.split('\0')) {
+    if (!rec) continue;
+    const tab = rec.indexOf('\t');
+    if (tab < 0) continue;
+    const meta = rec.slice(0, tab).split(' ');
+    targetBlob.set(rec.slice(tab + 1), meta[2]);
+  }
+
+  const perCommit = new Map();
+  let cur = '';
+  for (const line of rawR.stdout.split('\n')) {
+    if (line.startsWith('commit ')) {
+      cur = line.slice(7).trim();
+      if (!perCommit.has(cur)) perCommit.set(cur, []);
+      continue;
+    }
+    if (!cur || line[0] !== ':') continue;
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const meta = line.slice(1, tab).split(' ');
+    perCommit.get(cur).push({ oid: meta[3] || '', path: line.slice(tab + 1) });
+  }
+
+  const map = {};
+  for (const [sha, files] of perCommit) {
+    if (!files.length) continue; // 空提交不参与内容判定
+    const all = files.every((f) => {
+      const oid = targetBlob.get(f.path);
+      if (/^0+$/.test(f.oid)) return oid === undefined; // 该提交删了这个文件：目标上也不该有
+      return oid === f.oid;
+    });
+    if (all) map[sha] = true;
+  }
+  return { ok: true, map, checked: perCommit.size };
+}
+
+/* ---------- merge-tree 兜底：对内容比对仍判不出的候选做三方合并干跑 ---------- */
+
+const deepCache = new Map(); // key: root|targetTip|sha -> merged | conflict | diff | error
+let mergeTreeSupport = null; // null 未探测 / true 支持 / false 不支持
+
+/** 机器上的 git 是否支持 merge-tree --merge-base（2.40+） */
+async function mergeTreeSupported(root) {
+  if (mergeTreeSupport !== null) return mergeTreeSupport;
+  const r = await run(root, ['merge-tree', '-h'], { timeout: 20000 });
+  const txt = (r.stdout || '') + (r.stderr || '');
+  // usage 里是 '--[no-]merge-base'；老版本 git 的 usage 完全不出现 merge-base
+  mergeTreeSupport = txt.indexOf('merge-base') >= 0;
+  return mergeTreeSupport;
+}
+
+/**
+ * 把候选提交的改动三方合并到目标分支，干跑一次（不动工作区、不动索引）。
+ * 结果树 === 目标树  → 改动已在，判「已合并」
+ * 有冲突            → 目标分支上这段内容被改过，降级为「可能已合并，需人工确认」
+ * 结果树 !== 目标树  → 确实没合并
+ */
+async function deepFlags(root, { target, shas, cap = 300, concurrency = 4 } = {}) {
+  const map = {};
+  const unsure = {};
+  if (!target || !shas || !shas.length) return { ok: true, map, unsure };
+  if (!(await mergeTreeSupported(root))) return { ok: true, map, unsure, unsupported: true };
+
+  const [treeR, tipR] = await Promise.all([
+    run(root, ['rev-parse', target + '^{tree}'], { timeout: 20000 }),
+    run(root, ['rev-parse', target], { timeout: 20000 })
+  ]);
+  if (!treeR.ok) return { ok: false, error: mergeOutput(treeR) || '读取目标分支根树失败' };
+  const targetTree = treeR.stdout.trim();
+  const tip = tipR.ok ? tipR.stdout.trim() : target;
+
+  const list = shas.slice(0, cap);
+  let idx = 0;
+  const one = async (sha) => {
+    const key = root + '|' + tip + '|' + sha;
+    const hit = deepCache.get(key);
+    if (hit) {
+      if (hit === 'merged') map[sha] = true;
+      else if (hit === 'conflict') unsure[sha] = true;
+      return;
+    }
+    const judge = (r) => {
+      const out = (r.stdout || '').trim();
+      const first = (out.split(/\r?\n/)[0] || '').trim();
+      const isTree = /^[0-9a-f]{40,64}$/.test(first);
+      if (r.code === 0 && isTree) return first === targetTree ? 'merged' : 'diff';
+      if (r.code === 1 && isTree) return 'conflict';
+      return 'error';
+    };
+    const mergeAt = (extra = []) => run(root,
+      ['merge-tree', '--write-tree', '--merge-base=' + sha + '^', ...extra, tip, sha],
+      { timeout: 60000 });
+
+    let verdict = judge(await mergeAt());
+    // 冲突常见成因是空白/缩进差异（整文件被视为双方大改），忽略空白再试一次：
+    // 结果树仍等于目标树 → 内容其实一致，判已合并
+    if (verdict === 'conflict') {
+      const v2 = judge(await mergeAt(['-Xignore-all-space']));
+      if (v2 === 'merged') verdict = 'merged';
+    }
+    if (deepCache.size > 20000) deepCache.clear();
+    deepCache.set(key, verdict);
+    if (verdict === 'merged') map[sha] = true;
+    else if (verdict === 'conflict') unsure[sha] = true;
+  };
+  const worker = async () => { while (idx < list.length) { const s = list[idx++]; await one(s); } };
+  await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, worker));
+
+  return { ok: true, map, unsure, truncated: shas.length > cap ? shas.length - cap : 0 };
 }
 
 async function branchRemote(dir, branch) {
@@ -518,7 +864,7 @@ async function branchAheadBehind(dir, branch) {
  * mode = 'ff'    ：只做快进
  * 远端分支（origin/xxx）只更新引用，不做任何本地改动
  */
-async function pullBranch(dir, { branch, mode = 'rebase' } = {}) {
+async function pullBranch(dir, { branch, mode = 'rebase', autoStash = false } = {}) {
   const repo = await ensureRepo(dir);
   if (!repo.ok) return repo;
   const root = repo.root;
@@ -542,16 +888,37 @@ async function pullBranch(dir, { branch, mode = 'rebase' } = {}) {
   const current = curR.ok ? curR.stdout.trim() : '';
   const remote = await branchRemote(root, branch);
 
+  // 工作区有改动：默认拒绝；用户确认后可自动暂存，拉取/变基完成后再恢复
+  let stashed = false;
   if (current === branch) {
     const dirty = await getStatusShort(root);
     if (dirty.trim()) {
-      return {
-        ok: false,
-        error: '工作区有未提交的改动，' + (mode === 'rebase' ? '变基前' : '拉取前') + '请先提交或储藏：\n' +
-          dirty.trim().split('\n').slice(0, 15).join('\n')
-      };
+      if (!autoStash) {
+        return {
+          ok: false,
+          error: '工作区有未提交的改动，' + (mode === 'rebase' ? '变基前' : '拉取前') + '请先提交或储藏：\n' +
+            dirty.trim().split('\n').slice(0, 15).join('\n')
+        };
+      }
+      const sp = await stashPush(root, { message: 'FastRelease 拉取前自动暂存' });
+      logs.push({ cmd: 'git stash push -u', ok: sp.ok, output: sp.message || sp.error || '' });
+      if (!sp.ok) return { ok: false, error: sp.error || '自动暂存失败', logs };
+      stashed = sp.stashed;
     }
   }
+  const restore = async (res) => {
+    if (!stashed) return res;
+    const pop = await stashPop(root);
+    logs.push({ cmd: 'git stash pop', ok: pop.ok, output: pop.message || pop.error || '' });
+    return {
+      ...res,
+      stashed: true,
+      stashRestored: pop.ok,
+      stashConflict: !!pop.conflict,
+      stashFiles: pop.files || [],
+      stashError: pop.ok ? '' : pop.error
+    };
+  };
 
   const fetchR = await run(root, ['fetch', remote, '--prune'], { timeout: 300000 });
   logs.push({ cmd: fetchR.cmd, ok: fetchR.ok, output: mergeOutput(fetchR) });
@@ -567,27 +934,29 @@ async function pullBranch(dir, { branch, mode = 'rebase' } = {}) {
     logs.push({ cmd: pullR.cmd, ok: pullR.ok, output: mergeOutput(pullR) });
 
     if (pullR.ok) {
-      return { ok: true, logs, message: mode === 'ff' ? '已快进更新 ' + branch : '已变基到最新：' + branch };
+      return restore({ ok: true, logs, message: mode === 'ff' ? '已快进更新 ' + branch : '已变基到最新：' + branch });
     }
 
     const after = await conflictState(root);
     if (after.files.length) {
+      // 冲突时暂存先留着，等解决完继续 / 中止再恢复
       return {
         ok: false,
         conflict: true,
         operation: after.operation || 'rebase',
         files: after.files,
         logs,
+        stashed,
         error: '拉取时发生冲突（' + opLabel(after.operation || 'rebase') + '），请解决后继续。'
       };
     }
-    return {
+    return restore({
       ok: false,
       error: (mode === 'ff'
         ? '当前分支 ' + branch + ' 无法快进（本地有提交分叉）。可以把「拉取方式」改成变基再试。\n'
         : '变基失败：\n') + mergeOutput(pullR),
       logs
-    };
+    });
   }
 
   // 非当前分支：只允许快进，避免影响当前工作区
@@ -614,7 +983,7 @@ async function checkoutBranch(dir, branch) {
 /**
  * 摘取提交到目标分支
  */
-async function cherryPick(dir, { target, commits }) {
+async function cherryPick(dir, { target, commits, autoStash = false }) {
   const repo = await ensureRepo(dir);
   if (!repo.ok) return repo;
   const root = repo.root;
@@ -632,10 +1001,32 @@ async function cherryPick(dir, { target, commits }) {
     return { ok: false, error: '当前有未完成的「' + opLabel(op.operation) + '」，请先完成或中止后再操作。' };
   }
 
+  // 工作区有改动：默认拒绝；用户确认后可自动暂存，摘取完成/中止后再恢复
+  let stashed = false;
   const st = await getStatusShort(root);
   if (st.trim()) {
-    return { ok: false, error: '工作区有未提交的改动，请先提交或储藏：\n' + st.trim().split('\n').slice(0, 15).join('\n') };
+    if (!autoStash) {
+      return { ok: false, error: '工作区有未提交的改动，请先提交或储藏：\n' + st.trim().split('\n').slice(0, 15).join('\n') };
+    }
+    const sp = await stashPush(root, { message: 'FastRelease 摘取前自动暂存' });
+    logs.push({ cmd: 'git stash push -u', ok: sp.ok, output: sp.message || sp.error || '' });
+    if (!sp.ok) return { ok: false, error: sp.error || '自动暂存失败', logs };
+    stashed = sp.stashed;
   }
+  // 暂存后若出错（非冲突），把改动还回去，别让用户的工作白丢
+  const restore = async (res) => {
+    if (!stashed) return res;
+    const pop = await stashPop(root);
+    logs.push({ cmd: 'git stash pop', ok: pop.ok, output: pop.message || pop.error || '' });
+    return {
+      ...res,
+      stashed: true,
+      stashRestored: pop.ok,
+      stashConflict: !!pop.conflict,
+      stashFiles: pop.files || [],
+      stashError: pop.ok ? '' : pop.error
+    };
+  };
 
   // 提交顺序：按提交时间从旧到新
   const metaR = await run(root, ['show', '-s', '--format=%H%x1f%ct', ...list], { timeout: 30000 });
@@ -654,7 +1045,7 @@ async function cherryPick(dir, { target, commits }) {
     const co = await checkoutBranch(root, target);
     logs.push({ cmd: co.cmd, ok: co.ok, output: mergeOutput(co) });
     if (!co.ok) {
-      return { ok: false, error: '切换到目标分支 ' + target + ' 失败：\n' + mergeOutput(co), logs };
+      return restore({ ok: false, error: '切换到目标分支 ' + target + ' 失败：\n' + mergeOutput(co), logs });
     }
   }
 
@@ -662,13 +1053,14 @@ async function cherryPick(dir, { target, commits }) {
   logs.push({ cmd: r.cmd, ok: r.ok, output: mergeOutput(r) });
 
   if (r.ok) {
-    return { ok: true, logs, message: '已摘取 ' + sorted.length + ' 个提交到 ' + target, count: sorted.length };
+    return restore({ ok: true, logs, message: '已摘取 ' + sorted.length + ' 个提交到 ' + target, count: sorted.length });
   }
 
   const conflicted = await conflictState(root);
   const out = mergeOutput(r);
   if (conflicted.files.length) {
-    return { ok: false, conflict: true, files: conflicted.files, logs, error: '摘取时发生冲突，请解决后继续。', output: out };
+    // 冲突时暂存先不恢复：等用户解决完 continue / 中止之后再 pop
+    return { ok: false, conflict: true, files: conflicted.files, logs, stashed, error: '摘取时发生冲突，请解决后继续。', output: out };
   }
 
   // 提交内容已在目标分支存在时，git 会停下并提示补丁为空。
@@ -679,18 +1071,18 @@ async function cherryPick(dir, { target, commits }) {
     const after = await conflictState(root);
     if (after.files.length) {
       return {
-        ok: false, conflict: true, files: after.files, logs,
+        ok: false, conflict: true, files: after.files, logs, stashed,
         error: '部分提交内容已存在被自动跳过；剩余提交出现冲突，请解决。'
       };
     }
     if (await isCherryPicking(root)) {
       await run(root, ['cherry-pick', '--abort'], { timeout: 60000 });
-      return { ok: false, empty: true, logs, error: '所选提交的改动在目标分支上已全部存在，没有产生任何新提交。' };
+      return restore({ ok: false, empty: true, logs, error: '所选提交的改动在目标分支上已全部存在，没有产生任何新提交。' });
     }
-    return { ok: true, empty: true, logs, message: '摘取完成：内容已存在的提交已自动跳过' };
+    return restore({ ok: true, empty: true, logs, message: '摘取完成：内容已存在的提交已自动跳过' });
   }
 
-  return { ok: false, error: '摘取失败：\n' + out, logs };
+  return restore({ ok: false, error: '摘取失败：\n' + out, logs });
 }
 
 async function conflictState(dir) {
@@ -965,44 +1357,24 @@ async function checkMerged(dir, { source, target, author = '', since = '', until
   if (!source || !target) return { ok: false, error: '请选择源分支和目标分支' };
   if (source === target) return { ok: false, error: '源分支和目标分支不能相同' };
 
-  // 1) 先算出时间下界对应的基点提交，把 git cherry 的比对范围限制在「最近这段历史」，
-  //    否则它会对两个分支的全量历史算 patch-id，大仓库上非常慢。
-  let limitRef = '';
-  if (since) {
-    const baseR = await run(root, ['rev-list', '-1', '--before=' + since, source], { timeout: 30000 });
-    if (baseR.ok) limitRef = baseR.stdout.trim();
-  }
-
-  const cherryArgs = ['cherry', target, source];
-  if (limitRef) cherryArgs.push(limitRef);
-  const [cr, meR] = await Promise.all([
-    run(root, cherryArgs, { timeout: 300000 }),
-    run(root, ['config', '--get', 'user.name'], { timeout: 20000 })
-  ]);
-  if (!cr.ok) {
-    const msg = mergeOutput(cr);
-    if (/unknown revision|bad revision|not a valid/i.test(msg)) {
-      return { ok: false, error: '分支不存在或无法比较：\n' + msg };
-    }
-    return { ok: false, error: msg || 'git cherry 执行失败' };
-  }
-
-  // '+' = 目标分支没有等价补丁（未合并）；'-' = 已有等价补丁
-  const unmergedSet = new Set();
-  for (const line of cr.stdout.split('\n')) {
-    if (!line.trim()) continue;
-    if (line[0] === '+') unmergedSet.add(line.slice(2).trim());
-  }
-
-  // 2) 作者过滤交给 git 自己做（--author 用正则匹配 %an），不要拉回全量再在 JS 里筛。
+  // 作者过滤交给 git 自己做（--author 用正则匹配 %an），不要拉回全量再在 JS 里筛。
   const fmt = ['%H', '%h', '%an', '%ae', '%ad', '%ct', '%s'].join('%x1f');
   const args = ['log', source, '--date=iso-strict', '--pretty=format:' + fmt, '-n', '3000'];
   if (author) args.push('--author=' + author);
   if (since) args.push('--since=' + since);
   if (until) args.push('--until=' + until);
 
-  const lr = await run(root, args, { timeout: 60000 });
-  if (!lr.ok) return { ok: false, error: mergeOutput(lr) || '读取提交失败' };
+  const [lr, meR] = await Promise.all([
+    run(root, args, { timeout: 60000 }),
+    run(root, ['config', '--get', 'user.name'], { timeout: 20000 })
+  ]);
+  if (!lr.ok) {
+    const msg = mergeOutput(lr);
+    if (/unknown revision|bad revision|not a valid/i.test(msg)) {
+      return { ok: false, error: '分支不存在或无法比较：\n' + msg };
+    }
+    return { ok: false, error: msg || '读取提交失败' };
+  }
 
   let commits = lr.stdout.split('\n').filter(Boolean).map((line) => {
     const f = line.split(SEP);
@@ -1014,11 +1386,38 @@ async function checkMerged(dir, { source, target, author = '', since = '', until
       date: f[4],
       timestamp: parseInt(f[5], 10) || 0,
       subject: f[6] || '',
-      merged: !unmergedSet.has(f[0])
+      merged: false
     };
   });
-
   if (author) commits = commits.filter((c) => c.author === author);
+
+  // 和「已摘取」徽标走同一套判定（mergedStatus），避免两处口径不一致
+  const st = await mergedStatus(root, {
+    source, target, since, until,
+    only: commits.map((c) => c.hash),
+    deepCap: 600
+  });
+  if (!st.ok) return { ok: false, error: st.error };
+
+  let squashCount = 0;
+  let maybeCount = 0;
+  for (const c of commits) {
+    if (st.patch.has(c.hash)) {
+      c.merged = true;
+      c.mergeKind = 'patch';
+    } else if (st.content.has(c.hash)) {
+      c.merged = true;
+      c.mergeKind = 'squash';
+      squashCount += 1;
+    } else if (st.deep.has(c.hash)) {
+      c.merged = true;
+      c.mergeKind = 'deep';
+      squashCount += 1;
+    } else if (st.unsure.has(c.hash)) {
+      c.maybe = true;
+      maybeCount += 1;
+    }
+  }
 
   const unmerged = commits.filter((c) => !c.merged);
   return {
@@ -1030,6 +1429,9 @@ async function checkMerged(dir, { source, target, author = '', since = '', until
     total: commits.length,
     unmergedCount: unmerged.length,
     mergedCount: commits.length - unmerged.length,
+    squashCount,
+    maybeCount,
+    window: st.window,
     commits
   };
 }
@@ -1055,6 +1457,14 @@ module.exports = {
   listCommits,
   cherryFlags,
   patchFlags,
+  contentFlags,
+  deepFlags,
+  workingChanges,
+  workingDiff,
+  stashPush,
+  stashPop,
+  stashFinish,
+  stashAbort,
   branchAheadBehind,
   pullBranch,
   pushBranch,
@@ -1071,5 +1481,6 @@ module.exports = {
   repoLog,
   listAuthors,
   checkMerged,
+  mergedStatus,
   mergeOutput
 };
