@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld('api', {
   pull: (dir, branch, mode, autoStash) => invoke('repo:pull', { dir, branch, mode, autoStash }),
   push: (dir, branch) => invoke('repo:push', { dir, branch }),
   cherryPick: (payload) => invoke('repo:cherryPick', payload),
+  orderCommits: (dir, commits) => invoke('repo:orderCommits', { dir, commits }),
   commitDetail: (dir, hash) => invoke('commit:detail', { dir, hash }),
   repoLog: (dir, ref) => invoke('repo:log', { dir, ref }),
   authors: (payload) => invoke('repo:authors', payload),

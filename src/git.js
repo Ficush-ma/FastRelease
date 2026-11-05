@@ -981,6 +981,42 @@ async function checkoutBranch(dir, branch) {
 }
 
 /**
+ * 把一组提交排成「从旧到新」的安全顺序。
+ *
+ * 关键是不能用提交时间：同一次推送、批量脚本、squash 前的连续提交，时间戳
+ * 常常完全相同（精度只到秒），按时间排会退化成输入顺序——而输入顺序是列表
+ * 从上到下的「新→旧」，于是倒着摘，几处改动叠在同一块区域就必然冲突。
+ *
+ * 做法：`git rev-list --topo-order` 输出这些提交及其祖先（已按拓扑排序，父在前），
+ * 只保留我们关心的那些，保持该顺序即为祖先优先；互不相干的分支再按时间兜底。
+ */
+async function orderCommits(root, list) {
+  const wanted = new Set(list);
+  if (wanted.size <= 1) return list.slice();
+  const r = await run(root, ['rev-list', '--topo-order', '--reverse', ...list], { timeout: 60000 });
+  if (r.ok) {
+    const seq = r.stdout.split('\n').map((x) => x.trim()).filter(Boolean);
+    const ordered = seq.filter((sha) => wanted.has(sha));
+    if (ordered.length === wanted.size) return ordered;
+  }
+  // 兜底：按作者/提交时间从旧到新（相同时间保持输入顺序的稳定排序）
+  const metaR = await run(root, ['show', '-s', '--format=%H' + SEP + '%ct' + SEP + '%at', ...list], { timeout: 30000 });
+  const order = new Map();
+  const idx = new Map(list.map((s, i) => [s, i]));
+  if (metaR.ok) {
+    for (const line of metaR.stdout.split('\n')) {
+      const f = line.split(SEP);
+      if (f[0]) order.set(f[0].trim(), [parseInt(f[1], 10) || 0, parseInt(f[2], 10) || 0]);
+    }
+  }
+  return list.slice().sort((a, b) => {
+    const oa = order.get(a) || [0, 0];
+    const ob = order.get(b) || [0, 0];
+    return oa[0] - ob[0] || oa[1] - ob[1] || (idx.get(b) || 0) - (idx.get(a) || 0);
+  });
+}
+
+/**
  * 摘取提交到目标分支
  */
 async function cherryPick(dir, { target, commits, autoStash = false }) {
@@ -1028,16 +1064,10 @@ async function cherryPick(dir, { target, commits, autoStash = false }) {
     };
   };
 
-  // 提交顺序：按提交时间从旧到新
-  const metaR = await run(root, ['show', '-s', '--format=%H%x1f%ct', ...list], { timeout: 30000 });
-  const order = new Map();
-  if (metaR.ok) {
-    for (const line of metaR.stdout.split('\n')) {
-      const f = line.split(SEP);
-      if (f[0]) order.set(f[0].trim(), parseInt(f[1], 10) || 0);
-    }
-  }
-  const sorted = list.slice().sort((a, b) => (order.get(a) || 0) - (order.get(b) || 0));
+  // 提交顺序：从旧到新。不能用提交时间戳——同一次推送/批量生成的提交时间常常
+  // 完全一样（同一秒），按时间排序会退化成原始顺序，等于倒着摘，必然冲突。
+  // 因此优先按祖先关系排序（被依赖的提交在前），只在互不相干时才用时间兜底。
+  const sorted = await orderCommits(root, list);
 
   const curR = await run(root, ['rev-parse', '--abbrev-ref', 'HEAD'], { timeout: 20000 });
   const current = curR.ok ? curR.stdout.trim() : '';
@@ -1469,6 +1499,7 @@ module.exports = {
   pullBranch,
   pushBranch,
   cherryPick,
+  orderCommits,
   conflictState,
   readConflictFile,
   conflictStages,

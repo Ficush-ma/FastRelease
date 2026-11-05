@@ -153,6 +153,7 @@ handle('repo:pull', (p) => git.pullBranch(p.dir, { branch: p.branch, mode: p.mod
 handle('repo:push', (p) => git.pushBranch(p.dir, p.branch));
 
 handle('repo:cherryPick', (p) => git.cherryPick(p.dir, p));
+handle('repo:orderCommits', (p) => git.orderCommits(p.dir, p.commits || []));
 
 handle('repo:conflicts', (p) => git.conflictState(p.dir));
 
